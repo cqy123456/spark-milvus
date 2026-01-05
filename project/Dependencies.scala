@@ -3,7 +3,9 @@ import sbt._
 object Dependencies {
   // Version constants
   lazy val scalapbVersion = "0.11.3"
-  lazy val sparkVersion = "4.0.0"
+  // Spark 4.0.0 requires Java 17+ and may not be compatible with older clusters
+  // lazy val sparkVersion = "4.0.0"
+  lazy val sparkVersion = "3.5.4"  // Use Spark 3.5.4 for better cluster compatibility
   lazy val grpcJavaVersion = "1.37.0"
   // lazy val sparkVersion = "3.3.2"
   lazy val parquetVersion = "1.13.1"
@@ -63,4 +65,8 @@ object Dependencies {
   lazy val arrowMemoryCore = "org.apache.arrow" % "arrow-memory-core" % arrowVersion
   lazy val arrowMemoryNetty = "org.apache.arrow" % "arrow-memory-netty" % arrowVersion
   lazy val arrowCData = "org.apache.arrow" % "arrow-c-data" % arrowVersion
+
+  // HDF5 for reading ANN benchmark datasets
+  // Using CISD JHDF5 from SciJava repository
+  lazy val hdf5 = "cisd" % "jhdf5" % "19.04.1"
 }

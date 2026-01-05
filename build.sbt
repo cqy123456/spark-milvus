@@ -145,8 +145,13 @@ lazy val root = (project in file("."))
       arrowVector,
       arrowMemoryCore,
       arrowMemoryNetty,
-      arrowCData
+      arrowCData,
+      hdf5  // For SIFT1M benchmark
     ),
+
+    // Add SciJava repository for HDF5 library
+    resolvers += "SciJava Public" at "https://maven.scijava.org/content/groups/public/",
+
     Compile / PB.protoSources += baseDirectory.value / "milvus-proto/proto",
     Compile / PB.targets := Seq(
       scalapb.gen(grpc = true) -> (Compile / sourceManaged).value / "scalapb"
