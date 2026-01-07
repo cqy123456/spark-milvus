@@ -2,6 +2,22 @@
 
 这个基准测试用于对比标准 K-Means 和 Mini-Batch K-Means 在 SIFT1M 数据集上的性能表现。
 
+## ⚡ 快速开始
+
+如果数据已经准备好，直接运行：
+
+```bash
+./test-sift1m-benchmark.sh
+```
+
+或使用 sbt：
+
+```bash
+sbt "testOnly com.zilliz.spark.connector.operations.clustering.Sift1MBenchMark"
+```
+
+详细使用文档请查看：[SIFT1M_BENCHMARK_USAGE.md](SIFT1M_BENCHMARK_USAGE.md)
+
 ## 📋 测试配置
 
 - **数据集**: SIFT1M (1,000,000 个 128 维向量) - 二进制格式

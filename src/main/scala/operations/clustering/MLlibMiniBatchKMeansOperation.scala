@@ -1,38 +1,36 @@
 package com.zilliz.spark.connector.operations.clustering
 
-import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.apache.spark.ml.clustering.{KMeans => MLlibKMeans}
+import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{ArrayType, DataTypes, FloatType, StructField}
+import org.apache.spark.sql.types.{ArrayType, FloatType}
 import org.slf4j.{Logger, LoggerFactory}
 import scala.collection.mutable
 
 /**
- * Mini-Batch K-Means clustering operation with incremental learning
+ * MLlib-based Mini-Batch K-Means clustering operation
  *
- * Algorithm:
- * 1. Initialize cluster centers using K-Means++ on a small sample (if initMode="k-means||")
- *    or random sampling (if initMode="random")
- * 2. For each mini-batch iteration:
- *    a. Sample a batch of data points
- *    b. Assign each point to nearest cluster center
- *    c. Update cluster centers using incremental formula:
- *       center_new = center_old + eta * (batch_mean - center_old)
- *       where eta = batch_count / (total_count_for_cluster)
- * 3. Final prediction uses trained centers on full dataset
+ * This operation uses MLlib KMeans for k-means++ initialization (when initMode="k-means||"),
+ * then performs mini-batch incremental updates. It works with Milvus Array[Float] format:
+ * - Input: Array[Float] (Milvus format)
+ * - K-means++ init: Converts to Vector[Double] for MLlib, then back to Float
+ * - Mini-batch updates: Native Float operations
+ * - Output: KMeansModel with Array[Float] centers
  *
- * IMPORTANT: This operation works directly with Array[Float] (Milvus format).
- * Conversion to Vector only happens when using MLlib KMeans for initialization (initMode="k-means||")
+ * Use this when you want MLlib's proven k-means++ initialization with mini-batch training.
+ * For pure Float implementation without MLlib, use MiniBatchKMeansOperation instead.
  *
  * @param k Number of clusters
  * @param batchSize Fraction of data to sample per batch (0.0-1.0)
  * @param numBatches Number of mini-batch iterations
- * @param initMaxIter Max iterations for K-Means++ initialization
+ * @param initMaxIter Max iterations for K-Means++ initialization (only used if initMode="k-means||")
  * @param seed Random seed
  * @param featuresCol Features column name
  * @param predictionCol Prediction column name
- * @param initMode Initialization mode: "k-means||" (k-means++) or "random"
+ * @param initMode Initialization mode: "k-means||" (uses MLlib) or "random" (native Float)
  */
-class MiniBatchKMeansOperation(
+class MLlibMiniBatchKMeansOperation(
   val k: Int,
   val batchSize: Double = 0.1,
   val numBatches: Int = 10,
@@ -43,7 +41,7 @@ class MiniBatchKMeansOperation(
   val initMode: String = "k-means||"
 ) extends Serializable {
 
-  private val logger: Logger = LoggerFactory.getLogger(classOf[MiniBatchKMeansOperation])
+  private val logger: Logger = LoggerFactory.getLogger(classOf[MLlibMiniBatchKMeansOperation])
 
   require(k > 0, "Number of clusters must be positive")
   require(batchSize > 0.0 && batchSize <= 1.0, "Batch size must be between 0.0 and 1.0")
@@ -53,10 +51,9 @@ class MiniBatchKMeansOperation(
 
   /**
    * Train Mini-Batch K-Means and return the model
-   * Accepts DataFrame with Array[Float] (Milvus format)
    */
   def fit(df: DataFrame): KMeansModel = {
-    logger.info(s"Training Mini-Batch K-Means: k=$k, batchSize=$batchSize, numBatches=$numBatches, initMode=$initMode")
+    logger.info(s"Training MLlib Mini-Batch K-Means: k=$k, batchSize=$batchSize, numBatches=$numBatches, initMode=$initMode")
 
     val spark = df.sparkSession
     val startTime = System.currentTimeMillis()
@@ -89,11 +86,28 @@ class MiniBatchKMeansOperation(
       }
       randomSample
     } else {
-      // K-Means++ initialization: native Float implementation
-      logger.info("Using k-means++ initialization (native Float implementation)")
+      // K-Means++ initialization: use MLlib KMeans
+      logger.info("Using k-means++ initialization via MLlib KMeans (converting to Vector temporarily)")
 
-      val initSample = df.sample(false, Math.min(0.1, batchSize * 2), seed)
-      initializeKMeansPlusPlus(initSample, k, seed)
+      val toVector = udf((arr: Seq[Float]) => {
+        Vectors.dense(arr.map(_.toDouble).toArray)
+      })
+
+      val vectorDF = df.withColumn("__mllib_features", toVector(col(featuresCol)))
+      val initSample = vectorDF.sample(false, Math.min(0.1, batchSize * 2), seed)
+
+      val initKMeans = new MLlibKMeans()
+        .setK(k)
+        .setMaxIter(initMaxIter)
+        .setInitMode(initMode)
+        .setSeed(seed)
+        .setFeaturesCol("__mllib_features")
+        .setPredictionCol(predictionCol)
+
+      val initModel = initKMeans.fit(initSample)
+
+      // Convert Vector centers back to Array[Float]
+      initModel.clusterCenters.map(v => v.toArray.map(_.toFloat))
     }
 
     val initEnd = System.currentTimeMillis()
@@ -135,40 +149,35 @@ class MiniBatchKMeansOperation(
       // Broadcast centers for efficient access
       val broadcastCenters = spark.sparkContext.broadcast(centers)
 
-      // Compute cluster statistics using mapPartitions + reduceByKey
-      // Similar to KMeansOperation and MLlib KMeans for better performance
+      // Compute cluster statistics using mapPartitions + reduce
       val clusterStatsRDD = batch.rdd.mapPartitions { iter =>
         val localCenters = broadcastCenters.value
-        val dim = localCenters(0).length
-        val localStats = Array.fill(localCenters.length)(
-          (new Array[Float](dim), 0)
-        )
+        val localStats = mutable.HashMap[Int, (Array[Float], Int)]()
 
         iter.foreach { row =>
           val features = row.getAs[Seq[Float]](featuresCol).toArray
           val closestCluster = findClosestClusterFloat(features, localCenters)
 
-          // Accumulate sum and count
-          val (sum, count) = localStats(closestCluster)
-          for (i <- features.indices) {
-            sum(i) += features(i)
+          localStats.get(closestCluster) match {
+            case Some((sum, count)) =>
+              for (i <- sum.indices) {
+                sum(i) += features(i)
+              }
+              localStats(closestCluster) = (sum, count + 1)
+            case None =>
+              localStats(closestCluster) = (features.clone(), 1)
           }
-          localStats(closestCluster) = (sum, count + 1)
         }
 
-        // Emit (clusterId, stats) pairs - only for non-empty clusters
-        Iterator.tabulate(localCenters.length) { clusterId =>
-          (clusterId, localStats(clusterId))
-        }.filter(_._2._2 > 0)  // Filter out empty clusters to reduce shuffle
-      }.reduceByKey { (v1, v2) =>
-        // Merge statistics for the same cluster
+        localStats.iterator
+      }.reduceByKey((v1: (Array[Float], Int), v2: (Array[Float], Int)) => {
         val (sum1, count1) = v1
         val (sum2, count2) = v2
         for (i <- sum1.indices) {
           sum1(i) += sum2(i)
         }
         (sum1, count1 + count2)
-      }.collectAsMap()  // Use collectAsMap for direct lookup
+      }).collect()
 
       broadcastCenters.destroy()
       batch.unpersist()
@@ -211,6 +220,7 @@ class MiniBatchKMeansOperation(
       val updateTime = updateEnd - updateStart
       totalUpdateTime += updateTime
 
+      logger.info(s"  [Update] Time: ${updateTime} ms, Updated ${clusterStatsRDD.length} centers")
 
       val iterTime = System.currentTimeMillis() - iterStart
       totalIterationTime += iterTime
@@ -228,7 +238,7 @@ class MiniBatchKMeansOperation(
 
     // Log final statistics
     logger.info("=" * 60)
-    logger.info("Mini-Batch K-Means Training Completed")
+    logger.info("MLlib Mini-Batch K-Means Training Completed")
     logger.info("=" * 60)
     logger.info(s"Initialization time:  ${initEnd - initStart} ms")
     logger.info(s"Actual iterations:    $numBatches")
@@ -274,96 +284,12 @@ class MiniBatchKMeansOperation(
 
     sum
   }
-
-  /**
-   * K-Means++ initialization: simplified version for mini-batch
-   * Selects k centers using distance-weighted sampling
-   */
-  private def initializeKMeansPlusPlus(
-    df: DataFrame,
-    k: Int,
-    seed: Long
-  ): Array[Array[Float]] = {
-    val spark = df.sparkSession
-    val rand = new scala.util.Random(seed)
-
-    // Select first center randomly
-    val firstCenter = df.sample(false, 0.01, seed)
-      .limit(1)
-      .select(featuresCol)
-      .collect()
-      .head
-      .getAs[Seq[Float]](0)
-      .toArray
-
-    var centers = Array(firstCenter)
-    logger.info(s"K-means++ initialization: selected first center")
-
-    // Iteratively select remaining k-1 centers
-    for (step <- 1 until k) {
-      val bcCenters = spark.sparkContext.broadcast(centers)
-
-      // Compute squared distances to nearest center
-      val costs = df.select(featuresCol).rdd.map { row =>
-        val point = row.getAs[Seq[Float]](0).toArray
-        var minDist = Float.MaxValue
-        for (center <- bcCenters.value) {
-          val dist = squaredDistanceFloat(point, center)
-          if (dist < minDist) {
-            minDist = dist
-          }
-        }
-        (point, minDist)
-      }.persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK_SER)
-
-      // Use treeAggregate to compute total cost in parallel
-      val totalCost = costs.treeAggregate(0.0)(
-        seqOp = (sum, pointCost) => sum + pointCost._2,
-        combOp = (sum1, sum2) => sum1 + sum2,
-        depth = 2
-      )
-
-      // Sample new center proportional to squared distance
-      val threshold = rand.nextDouble() * totalCost
-      var cumulative = 0.0
-      var newCenter: Array[Float] = null
-
-      costs.toLocalIterator.foreach { case (point, cost) =>
-        if (newCenter == null) {
-          cumulative += cost
-          if (cumulative >= threshold) {
-            newCenter = point
-          }
-        }
-      }
-
-      costs.unpersist()
-      bcCenters.destroy()
-
-      if (newCenter != null) {
-        centers = centers :+ newCenter
-        logger.info(s"K-means++ initialization: selected center ${step + 1}/$k")
-      } else {
-        logger.warn(s"K-means++ initialization: failed to select center ${step + 1}, using random fallback")
-        val randomPoint = df.sample(false, 0.01, seed + step)
-          .limit(1)
-          .select(featuresCol)
-          .collect()
-          .head
-          .getAs[Seq[Float]](0)
-          .toArray
-        centers = centers :+ randomPoint
-      }
-    }
-
-    centers
-  }
 }
 
-object MiniBatchKMeansOperation {
+object MLlibMiniBatchKMeansOperation {
 
-  def apply(k: Int, batchSize: Double = 0.1, numBatches: Int = 10): MiniBatchKMeansOperation = {
-    new MiniBatchKMeansOperation(k = k, batchSize = batchSize, numBatches = numBatches)
+  def apply(k: Int, batchSize: Double = 0.1, numBatches: Int = 10): MLlibMiniBatchKMeansOperation = {
+    new MLlibMiniBatchKMeansOperation(k = k, batchSize = batchSize, numBatches = numBatches)
   }
 
   def apply(
@@ -373,8 +299,8 @@ object MiniBatchKMeansOperation {
     featuresCol: String,
     predictionCol: String,
     initMode: String
-  ): MiniBatchKMeansOperation = {
-    new MiniBatchKMeansOperation(
+  ): MLlibMiniBatchKMeansOperation = {
+    new MLlibMiniBatchKMeansOperation(
       k = k,
       batchSize = batchSize,
       numBatches = numBatches,
