@@ -1,5 +1,6 @@
 package com.zilliz.spark.connector.operations.clustering
 
+import com.zilliz.spark.connector.utils.VectorOps
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{ArrayType, DataTypes, FloatType}
@@ -393,7 +394,24 @@ class KMeansModel(
   private val logger: Logger = LoggerFactory.getLogger(classOf[KMeansModel])
 
   /**
-   * Transform DataFrame by assigning cluster IDs
+   * Transform DataFrame by assigning cluster IDs and computing distances
+   *
+   * Input DataFrame schema:
+   *   - features: Array[Float] - feature vectors
+   *   - (any other columns from input)
+   *
+   * Output DataFrame schema:
+   *   - features: Array[Float] - feature vectors (unchanged)
+   *   - (any other columns from input)
+   *   - cluster_id: Int - assigned cluster ID (0 to k-1)
+   *   - distance: Float - squared distance to assigned cluster center
+   *
+   * Example:
+   *   Input:  | features: Array[Float]           |
+   *           | [1.0, 2.0, 3.0, ...]             |
+   *
+   *   Output: | features: Array[Float]           | cluster_id: Int | distance: Float |
+   *           | [1.0, 2.0, 3.0, ...]             | 5               | 123.45          |
    */
   def transform(df: DataFrame): DataFrame = {
     val spark = df.sparkSession
@@ -403,10 +421,12 @@ class KMeansModel(
 
     df.map { row =>
       val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](featuresCol).toArray
-      val cluster = findClosestCluster(features, bcCenters.value)
-      Row.fromSeq(row.toSeq :+ cluster)
+      val (cluster, distance) = findClosestClusterWithDistance(features, bcCenters.value)
+      Row.fromSeq(row.toSeq :+ cluster :+ distance)
     }(org.apache.spark.sql.Encoders.row(
-      df.schema.add(predictionCol, DataTypes.IntegerType, false)
+      df.schema
+        .add(predictionCol, DataTypes.IntegerType, false)
+        .add("distance", DataTypes.FloatType, false)
     ))
   }
 
@@ -426,6 +446,24 @@ class KMeansModel(
     }
 
     closestIdx
+  }
+
+  /**
+   * Find closest cluster for a point and return cluster ID with distance
+   */
+  private def findClosestClusterWithDistance(point: Array[Float], centers: Array[Array[Float]]): (Int, Float) = {
+    var closestIdx = 0
+    var minDist = squaredDistance(point, centers(0))
+
+    for (i <- 1 until centers.length) {
+      val dist = squaredDistance(point, centers(i))
+      if (dist < minDist) {
+        minDist = dist
+        closestIdx = i
+      }
+    }
+
+    (closestIdx, minDist)
   }
 
   /**

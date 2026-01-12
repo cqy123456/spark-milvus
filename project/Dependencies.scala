@@ -69,4 +69,14 @@ object Dependencies {
   // HDF5 for reading ANN benchmark datasets
   // Using CISD JHDF5 from SciJava repository
   lazy val hdf5 = "cisd" % "jhdf5" % "19.04.1"
+
+  // GraphFrames for graph processing
+  lazy val graphframes = "graphframes" % "graphframes" % "0.8.3-spark3.5-s_2.12"
+
+  // ND4J for optimized linear algebra and vector operations
+  // nd4j-native-platform: CPU backend with AVX/AVX2/AVX-512 optimizations
+  // For GPU support, replace with nd4j-cuda-11.8-platform (requires CUDA 11.8+)
+  lazy val nd4jVersion = "1.0.0-M2.1"
+  lazy val nd4jNative = "org.nd4j" % "nd4j-native-platform" % nd4jVersion
+  // lazy val nd4jCuda = "org.nd4j" % "nd4j-cuda-11.8-platform" % nd4jVersion  // Uncomment for GPU support
 }

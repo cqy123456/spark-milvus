@@ -29,7 +29,7 @@ ThisBuild / organizationName := "zilliz"
 ThisBuild / organizationHomepage := Some(url("https://zilliz.com/"))
 // For cross-compiling (if applicable)
 // crossScalaVersions := Seq("2.12.x", "2.13.x")
-ThisBuild / scalaVersion := "2.13.16"
+ThisBuild / scalaVersion := "2.12.18"
 ThisBuild / description := "Milvus Spark Connector to use in Spark ETLs to populate a Milvus vector database."
 ThisBuild / versionScheme := Some("early-semver")
 
@@ -71,6 +71,7 @@ ThisBuild / developers := List(
 )
 
 lazy val root = (project in file("."))
+  .aggregate(benchmarks)
   .settings(
     name := "spark-connector",
     assembly / parallelExecution := true,
@@ -119,8 +120,8 @@ lazy val root = (project in file("."))
     ),
 
     // Add milvus-storage JNI library as unmanaged dependency
-    Compile / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.13" / "milvus-storage-jni-test_2.13-0.1.0-SNAPSHOT.jar",
-    Test / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.13" / "milvus-storage-jni-test_2.13-0.1.0-SNAPSHOT.jar",
+    Compile / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.12" / "milvus-storage-jni-test_2.12-0.1.0-SNAPSHOT.jar",
+    Test / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.12" / "milvus-storage-jni-test_2.12-0.1.0-SNAPSHOT.jar",
 
     libraryDependencies ++= Seq(
       munit % Test,
@@ -146,7 +147,9 @@ lazy val root = (project in file("."))
       arrowMemoryCore,
       arrowMemoryNetty,
       arrowCData,
-      hdf5  // For SIFT1M benchmark
+      hdf5,  // For SIFT1M benchmark
+      graphframes,  // For graph processing
+      nd4jNative  // ND4J for optimized vector operations (CPU backend with SIMD)
     ),
 
     // Add SciJava repository for HDF5 library
@@ -172,6 +175,43 @@ lazy val root = (project in file("."))
       art.withClassifier(Some("assembly"))
     },
     addArtifact(assembly / artifact, assembly)
+  )
+
+lazy val benchmarks = (project in file("benchmarks"))
+  .dependsOn(root)
+  .settings(
+    name := "spark-connector-benchmarks",
+    version := "0.2.1-SNAPSHOT",
+    organization := "com.zilliz",
+    scalaVersion := "2.12.18",
+
+    // Fork JVM for run
+    run / fork := true,
+
+    // JVM options for benchmarks
+    run / javaOptions ++= Seq(
+      "-Xss2m",
+      "-Djava.library.path=.",
+      "--add-opens=java.base/java.nio=ALL-UNNAMED"
+    ),
+
+    run / envVars := Map(
+      "LD_PRELOAD" -> (baseDirectory.value / ".." / "src" / "main" / "resources" / "native" / "libmilvus-storage.so").getAbsolutePath
+    ),
+
+    // Include main project dependencies
+    libraryDependencies ++= Seq(
+      sparkCore,
+      sparkSql,
+      sparkMLlib,
+      hdf5
+    ),
+
+    // Add milvus-storage JNI library
+    Compile / unmanagedJars += baseDirectory.value / ".." / "milvus-storage" / "java" / "target" / "scala-2.12" / "milvus-storage-jni-test_2.12-0.1.0-SNAPSHOT.jar",
+
+    // Inherit root project's assembly JAR for running benchmarks
+    Compile / run / fullClasspath := (Compile / run / fullClasspath).value
   )
 
 assembly / assemblyShadeRules := Seq(
@@ -207,6 +247,9 @@ assembly / assemblyMergeStrategy := {
   // Handle AWS SDK VersionInfo conflicts
   case PathList("software", "amazon", "awssdk", xs @ _*) if xs.last == "VersionInfo.class" =>
     MergeStrategy.first
+  // Handle @nowarn annotation conflicts between scala-library and scala-collection-compat
+  case PathList("scala", "annotation", "nowarn.class") => MergeStrategy.first
+  case PathList("scala", "annotation", "nowarn$.class") => MergeStrategy.first
   // Default case
   case x =>
     val oldStrategy = (ThisBuild / assemblyMergeStrategy).value

@@ -1,4 +1,4 @@
-package com.zilliz.spark.connector.benchmarks
+package com.zilliz.spark.benchmarks
 
 import com.zilliz.spark.connector.operations.clustering.{KMeansOperation, MiniBatchKMeansOperation,MLlibKMeansOperation}
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -121,24 +121,18 @@ object Sift1MBenchmark {
     // Load training data from Parquet (distributed by default)
     logger.info("Loading training data from Parquet...")
     val trainPath = s"$parquetDir/sift1m-train.parquet"
-    val rawTrainDF = spark.read.parquet(trainPath)
+    val trainDF = spark.read.parquet(trainPath)
 
-    // Check and ensure Array[Float] format for MiniBatchKMeans
-    import org.apache.spark.sql.functions._
+    // Verify Array[Float] format
     import org.apache.spark.sql.types._
-    val featuresType = rawTrainDF.schema("features").dataType
+    val featuresType = trainDF.schema("features").dataType
     logger.info(s"Parquet features column type: $featuresType")
 
-    val trainDF = featuresType match {
+    featuresType match {
       case ArrayType(FloatType, _) =>
-        logger.info("Features already in Array[Float] format")
-        rawTrainDF
-      case ArrayType(DoubleType, _) =>
-        logger.info("Converting features from Array[Double] to Array[Float]")
-        val toFloatArray = udf((arr: Seq[Double]) => arr.map(_.toFloat))
-        rawTrainDF.withColumn("features", toFloatArray(col("features")))
+        logger.info("✓ Features are in Array[Float] format as expected")
       case _ =>
-        throw new IllegalArgumentException(s"Unexpected features type: $featuresType")
+        throw new IllegalArgumentException(s"Expected Array[Float], got: $featuresType. Please regenerate Parquet files.")
     }
 
     trainDF.persist()
@@ -341,15 +335,27 @@ object Sift1MBenchmark {
     // Load test vectors
     val testPath = s"$parquetDir/sift1m-test.parquet"
     logger.info(s"Reading test vectors from: $testPath")
-    val testDF = spark.read.parquet(testPath)
-    logger.info("Collecting test vectors...")
-    val testVectors = testDF.collect().map { row =>
-      // Parquet stores as double, convert to float
-      val features = row.getAs[Seq[Double]](0).map(_.toFloat).toArray
-      features
+
+    val testVectors = try {
+      val testDF = spark.read.parquet(testPath)
+      logger.info(s"Test DataFrame schema: ${testDF.schema}")
+      logger.info(s"Test DataFrame partitions: ${testDF.rdd.getNumPartitions}")
+      logger.info(s"Test DataFrame count: ${testDF.count()}")
+
+      logger.info("Collecting test vectors...")
+      val vectors = testDF.collect().map { row =>
+        // Parquet now stores as Float directly (Array[Float])
+        val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](0).toArray
+        features
+      }
+      println(s"✓ Loaded ${vectors.length} test vectors of dimension ${vectors(0).length}")
+      logger.info(s"Loaded ${vectors.length} test vectors of dimension ${vectors(0).length}")
+      vectors
+    } catch {
+      case e: Exception =>
+        logger.error(s"Failed to load test vectors from $testPath", e)
+        throw e
     }
-    println(s"✓ Loaded ${testVectors.length} test vectors of dimension ${testVectors(0).length}")
-    logger.info(s"Loaded ${testVectors.length} test vectors of dimension ${testVectors(0).length}")
 
     // Load ground truth
     val gtPath = s"$parquetDir/sift1m-groundtruth.parquet"
@@ -378,10 +384,12 @@ object Sift1MBenchmark {
   /**
    * Load training data from Parquet as DataFrame (distributed by default)
    *
+   * DEPRECATED: This function was used for MLlib K-Means which requires Vector format.
+   * Now we use Array[Float] format throughout for consistency.
+   *
    * IMPORTANT: Maintains Float precision throughout
-   * - Raw data: Double (from Parquet)
-   * - Convert to Float first (to match original SIFT1M float32 precision)
-   * - Then convert to Double for MLlib Vector (MLlib requires Double)
+   * - Raw data: Float (from Parquet - already float32)
+   * - Convert to Double for MLlib Vector (MLlib requires Double)
    * - This ensures training uses the same precision as recall calculation
    */
   def loadTrainDataFromParquet(spark: SparkSession, parquetDir: String): DataFrame = {
@@ -397,17 +405,14 @@ object Sift1MBenchmark {
     println(s"Current partitions after reading Parquet: $currentPartitions")
     logger.info(s"Current partitions after reading Parquet: $currentPartitions")
 
-    // Convert to Spark Vector with Float precision
-    // 1. Parquet stores as Double
-    // 2. Convert to Float to match SIFT1M original precision
-    // 3. Convert back to Double for MLlib (which requires Double)
-    // This ensures the same precision loss as in recall calculation
+    // Convert Array[Float] to Spark Vector (which requires Double)
+    // Parquet stores as Float (float32), convert to Double for MLlib
     import org.apache.spark.sql.functions._
-    logger.info("Creating UDF to convert features to Spark Vector with Float precision...")
-    val toVectorFloat = udf((features: Seq[Double]) => {
-      // Convert Double -> Float -> Double to maintain Float precision
-      val floatPrecision = features.map(_.toFloat).map(_.toDouble)
-      Vectors.dense(floatPrecision.toArray)
+    logger.info("Creating UDF to convert Array[Float] to Spark Vector...")
+    val toVectorFloat = udf((features: scala.collection.mutable.WrappedArray[Float]) => {
+      // Convert Float -> Double for MLlib Vector
+      val doublePrecision = features.map(_.toDouble)
+      Vectors.dense(doublePrecision.toArray)
     })
 
     logger.info("Transforming DataFrame with Vector conversion and repartitioning to 100 partitions...")
@@ -419,10 +424,10 @@ object Sift1MBenchmark {
     println(s"✓ Training DataFrame loaded and repartitioned to $finalPartitions partitions")
     logger.info(s"Training DataFrame loaded and repartitioned to $finalPartitions partitions")
 
-    // Verify Float precision by checking first vector
+    // Verify by checking first vector
     val firstVec = vectorDF.limit(1).collect()(0).getAs[Vector](0).toArray
     logger.info(s"First training vector (first 5 dims): ${firstVec.take(5).mkString(", ")}")
-    logger.info("Note: Training data now uses Float precision (Double->Float->Double conversion)")
+    logger.info("Note: Training data loaded from Float Parquet, converted to Vector[Double] for MLlib")
 
     vectorDF
   }
@@ -439,8 +444,8 @@ object Sift1MBenchmark {
     val trainDF = spark.read.parquet(trainPath)
     logger.info("Collecting training vectors into array...")
     val trainVectors = trainDF.collect().map { row =>
-      // Parquet stores as double, convert to float
-      row.getAs[Seq[Double]](0).map(_.toFloat).toArray
+      // Parquet now stores as Float directly (Array[Float])
+      row.getAs[scala.collection.mutable.WrappedArray[Float]](0).toArray
     }
     println(s"✓ Loaded ${trainVectors.length} training vectors")
     logger.info(s"Loaded ${trainVectors.length} training vectors into memory")
@@ -500,6 +505,13 @@ object Sift1MBenchmark {
   /**
    * Calculate K-Means loss (inertia / WCSS) for custom Float KMeansModel
    * Works with Array[Float] features
+   *
+   * Input DataFrame schema (from model.transform()):
+   *   - features: Array[Float] - feature vectors
+   *   - cluster_id: Int - assigned cluster ID
+   *   - distance: Float - squared distance to cluster center (computed by transform)
+   *
+   * Returns: sum of all squared distances (Within-Set Sum of Squared Errors)
    */
   def calculateLossFloat(
     predictions: DataFrame,
@@ -510,19 +522,30 @@ object Sift1MBenchmark {
     val clusterCenters = model.clusterCenters
     logger.info(s"Model has ${clusterCenters.length} cluster centers")
 
-    logger.info("Computing squared distances sum...")
-    val distances = predictions.select(featuresCol, "cluster_id").rdd.map { row =>
-      val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](0)
-      val clusterId = row.getInt(1)
-      val center = clusterCenters(clusterId)
+    // Check if distance column exists (from new transform implementation)
+    val hasDistanceCol = predictions.columns.contains("distance")
+    logger.info(s"Using distance column for loss calculation: $hasDistanceCol")
 
-      var sum = 0.0
-      for (i <- features.indices) {
-        val diff = features(i) - center(i)
-        sum += diff * diff
-      }
-      sum
-    }.sum()
+    val distances = if (hasDistanceCol) {
+      // Use pre-computed distances from transform() - much faster!
+      logger.info("Computing loss using pre-computed distance column...")
+      predictions.select("distance").rdd.map(_.getFloat(0).toDouble).sum()
+    } else {
+      // Fallback: recompute distances (for backward compatibility)
+      logger.info("Computing squared distances sum (distance column not found, recomputing)...")
+      predictions.select(featuresCol, "cluster_id").rdd.map { row =>
+        val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](0)
+        val clusterId = row.getInt(1)
+        val center = clusterCenters(clusterId)
+
+        var sum = 0.0
+        for (i <- features.indices) {
+          val diff = features(i) - center(i)
+          sum += diff * diff
+        }
+        sum
+      }.sum()
+    }
 
     logger.info(f"Total loss (inertia): $distances%.2f")
     distances

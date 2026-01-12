@@ -1,5 +1,6 @@
 package com.zilliz.spark.connector.operations.clustering
 
+import com.zilliz.spark.connector.utils.VectorOps
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{ArrayType, DataTypes, FloatType, StructField}
@@ -245,15 +246,20 @@ class MiniBatchKMeansOperation(
 
   /**
    * Find closest cluster center to a point (Float precision)
+   * Uses ND4J batch distance computation for optimal SIMD performance
    */
   private def findClosestClusterFloat(point: Array[Float], centers: Array[Array[Float]]): Int = {
-    var closestCluster = 0
-    var minDistance = squaredDistanceFloat(point, centers(0))
+    // Use ND4J batch computation to calculate distances to all centers at once
+    // This leverages SIMD instructions and is much faster than sequential computation
+    val distances = VectorOps.batchEuclideanDistance(point, centers)
 
-    for (i <- 1 until centers.length) {
-      val distance = squaredDistanceFloat(point, centers(i))
-      if (distance < minDistance) {
-        minDistance = distance
+    // Find index of minimum distance
+    var closestCluster = 0
+    var minDistance = distances(0)
+
+    for (i <- 1 until distances.length) {
+      if (distances(i) < minDistance) {
+        minDistance = distances(i)
         closestCluster = i
       }
     }
@@ -263,16 +269,11 @@ class MiniBatchKMeansOperation(
 
   /**
    * Compute squared Euclidean distance with Float precision
+   * Uses ND4J for SIMD-optimized computation
    */
   private def squaredDistanceFloat(v1: Array[Float], v2: Array[Float]): Float = {
-    var sum = 0.0f
-
-    for (i <- v1.indices) {
-      val diff = v1(i) - v2(i)
-      sum += diff * diff
-    }
-
-    sum
+    val dist = VectorOps.euclideanDistance(v1, v2)
+    dist * dist  // Return squared distance
   }
 
   /**

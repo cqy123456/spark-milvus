@@ -1,7 +1,16 @@
 #!/bin/bash
 
 # Script to run SIFT1M Benchmark as standalone Spark application
-SPARK_MASTER="${SPARK_MASTER:-spark://cqy:7077}"
+# Usage:
+#   ./run-sift1m-benchmark.sh                        # Use default settings
+#   SPARK_MASTER=spark://host:7077 ./run-sift1m-benchmark.sh  # Custom master
+#   NUM_EXECUTORS=8 EXECUTOR_CORES=8 ./run-sift1m-benchmark.sh # Custom resources
+
+SPARK_MASTER="${SPARK_MASTER:-spark://10.15.2.60:7077}"
+NUM_EXECUTORS="${NUM_EXECUTORS:-4}"
+EXECUTOR_CORES="${EXECUTOR_CORES:-2}"
+EXECUTOR_MEMORY="${EXECUTOR_MEMORY:-8g}"
+DRIVER_MEMORY="${DRIVER_MEMORY:-8g}"
 
 echo "======================================================================"
 echo "SIFT1M Benchmark: K-Means vs Mini-Batch K-Means"
@@ -35,7 +44,8 @@ echo "  ✓ Test data: $(du -h ./data/parquet/sift1m-test.parquet | cut -f1)"
 echo "  ✓ Ground truth: $(du -h ./data/parquet/sift1m-groundtruth.parquet | cut -f1)"
 
 # Build assembly JAR if needed
-if [ ! -f "target/scala-2.13/spark-connector-assembly-0.2.1-SNAPSHOT.jar" ]; then
+JAR_PATH="target/scala-2.12/spark-connector-assembly-0.2.1-SNAPSHOT.jar"
+if [ ! -f "$JAR_PATH" ]; then
     echo ""
     echo "Building assembly JAR..."
     sbt assembly
@@ -46,35 +56,52 @@ if [ ! -f "target/scala-2.13/spark-connector-assembly-0.2.1-SNAPSHOT.jar" ]; the
 fi
 
 echo ""
+echo "Configuration:"
+echo "  Spark Master: $SPARK_MASTER"
+echo "  Executors: $NUM_EXECUTORS"
+echo "  Executor Cores: $EXECUTOR_CORES"
+echo "  Executor Memory: $EXECUTOR_MEMORY"
+echo "  Driver Memory: $DRIVER_MEMORY"
+
+echo ""
 echo "Running benchmark (this may take several minutes)..."
 echo "----------------------------------------------------------------------"
 
 # Set environment variables
 export ASAN_OPTIONS=verify_asan_link_order=0
 
+# Force Java 11 to match executor (fixes Java version mismatch causing EOFException)
+export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+export PATH=$JAVA_HOME/bin:$PATH
+
 # Create Spark temp directories if they don't exist
-SPARK_LOCAL_DIRS="/home/cqy/workspace/spark-temp"
+SPARK_LOCAL_DIRS="/home/ubuntu/spark-workspace"
 mkdir -p "$SPARK_LOCAL_DIRS"
 echo "Using Spark local directory: $SPARK_LOCAL_DIRS"
 
 # Run with spark-submit
 spark-submit \
-  --class com.zilliz.spark.connector.benchmarks.Sift1MBenchmark \
+  --class com.zilliz.spark.benchmarks.Sift1MBenchmark \
   --master "$SPARK_MASTER" \
-  --driver-memory 12g \
-  --executor-memory 12g \
-  --executor-cores 4 \
-  --num-executors 4 \
-  --conf spark.sql.shuffle.partitions=100 \
-  --conf spark.default.parallelism=100 \
+  --driver-memory "$DRIVER_MEMORY" \
+  --executor-memory "$EXECUTOR_MEMORY" \
+  --executor-cores "$EXECUTOR_CORES" \
+  --num-executors "$NUM_EXECUTORS" \
+  --conf spark.sql.shuffle.partitions=200 \
+  --conf spark.default.parallelism=200 \
   --conf spark.serializer=org.apache.spark.serializer.KryoSerializer \
-  --conf spark.kryoserializer.buffer.max=1024m \
-  --conf spark.driver.maxResultSize=4g \
+  --conf spark.kryoserializer.buffer.max=512m \
+  --conf spark.driver.maxResultSize=12g \
   --conf spark.sql.adaptive.enabled=false \
+  --conf spark.rpc.message.maxSize=1024 \
+  --conf spark.network.timeout=800s \
+  --conf spark.executor.heartbeatInterval=60s \
+  --conf spark.storage.memoryFraction=0.6 \
+  --conf spark.shuffle.memoryFraction=0.3 \
   --conf spark.local.dir="$SPARK_LOCAL_DIRS" \
   --conf spark.driver.extraJavaOptions="-Djava.io.tmpdir=$SPARK_LOCAL_DIRS" \
   --conf spark.executor.extraJavaOptions="-Djava.io.tmpdir=$SPARK_LOCAL_DIRS" \
-  target/scala-2.13/spark-connector-assembly-0.2.1-SNAPSHOT.jar \
+  "$JAR_PATH" \
   ./data/parquet
 
 if [ $? -eq 0 ]; then

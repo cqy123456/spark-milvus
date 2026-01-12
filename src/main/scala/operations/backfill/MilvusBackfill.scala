@@ -449,7 +449,7 @@ object MilvusBackfill {
       def writeRow(row: InternalRow): Unit = {
         val targetFields = (2 until row.numFields).map(i =>
           row.get(i, targetSchema.fields(i - 2).dataType)
-        ).toArray
+        ).toArray[Any]
         if (targetFields.forall(_ == null)) nullRowCount += 1
         writer.write(new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(targetFields))
         rowCount += 1
