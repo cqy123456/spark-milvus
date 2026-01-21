@@ -3,8 +3,6 @@ package com.zilliz.spark.connector.operations.clustering
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.BeforeAndAfterAll
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.ml.linalg.{Vector, Vectors}
-import org.apache.spark.sql.functions._
 
 /**
  * Test suite for KMeansOperation and MiniBatchKMeansOperation
@@ -30,32 +28,35 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     val sparkSession = spark
     import sparkSession.implicits._
 
-    // Create test data: 3 clusters
+    // Create test data: 3 clusters (using Array[Float])
     val data = Seq(
       // Cluster 0: around (0, 0)
-      Tuple1(Vectors.dense(0.0, 0.0)),
-      Tuple1(Vectors.dense(0.1, 0.1)),
-      Tuple1(Vectors.dense(-0.1, 0.1)),
-      Tuple1(Vectors.dense(0.1, -0.1)),
+      Tuple1(Array(0.0f, 0.0f)),
+      Tuple1(Array(0.1f, 0.1f)),
+      Tuple1(Array(-0.1f, 0.1f)),
+      Tuple1(Array(0.1f, -0.1f)),
       // Cluster 1: around (5, 5)
-      Tuple1(Vectors.dense(5.0, 5.0)),
-      Tuple1(Vectors.dense(5.1, 5.1)),
-      Tuple1(Vectors.dense(4.9, 5.1)),
-      Tuple1(Vectors.dense(5.1, 4.9)),
+      Tuple1(Array(5.0f, 5.0f)),
+      Tuple1(Array(5.1f, 5.1f)),
+      Tuple1(Array(4.9f, 5.1f)),
+      Tuple1(Array(5.1f, 4.9f)),
       // Cluster 2: around (10, 10)
-      Tuple1(Vectors.dense(10.0, 10.0)),
-      Tuple1(Vectors.dense(10.1, 10.1)),
-      Tuple1(Vectors.dense(9.9, 10.1)),
-      Tuple1(Vectors.dense(10.1, 9.9))
+      Tuple1(Array(10.0f, 10.0f)),
+      Tuple1(Array(10.1f, 10.1f)),
+      Tuple1(Array(9.9f, 10.1f)),
+      Tuple1(Array(10.1f, 9.9f))
     ).toDF("features")
 
     val kmeansOp = new KMeansOperation(
       k = 3,
       maxIter = 20,
-      featuresCol = "features"
+      featuresCol = "features",
+      initMode = "random"
     )
 
-    val result = kmeansOp.transform(data)
+    // Fit and transform
+    val model = kmeansOp.fit(data)
+    val result = model.transform(data)
 
     // Verify result has cluster_id column
     assert(result.columns.contains("cluster_id"))
@@ -82,17 +83,19 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     val k = 10
 
     val data = (0 until numPoints).map { i =>
-      val values = Array.fill(dim)(scala.util.Random.nextDouble())
-      Tuple1(Vectors.dense(values))
+      val values = Array.fill(dim)(scala.util.Random.nextFloat())
+      Tuple1(values)
     }.toDF("features")
 
     val kmeansOp = new KMeansOperation(
       k = k,
       maxIter = 50,
-      featuresCol = "features"
+      featuresCol = "features",
+      initMode = "random"
     )
 
-    val result = kmeansOp.transform(data)
+    val model = kmeansOp.fit(data)
+    val result = model.transform(data)
 
     assert(result.columns.contains("cluster_id"))
     assert(result.count() == numPoints)
@@ -108,13 +111,13 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     import sparkSession.implicits._
 
     val data = Seq(
-      Tuple1(Vectors.dense(0.0, 0.0)),
-      Tuple1(Vectors.dense(1.0, 1.0)),
-      Tuple1(Vectors.dense(5.0, 5.0)),
-      Tuple1(Vectors.dense(6.0, 6.0))
+      Tuple1(Array(0.0f, 0.0f)),
+      Tuple1(Array(1.0f, 1.0f)),
+      Tuple1(Array(5.0f, 5.0f)),
+      Tuple1(Array(6.0f, 6.0f))
     ).toDF("features")
 
-    val kmeansOp = new KMeansOperation(k = 2, maxIter = 20)
+    val kmeansOp = new KMeansOperation(k = 2, maxIter = 20, initMode = "random")
 
     // Fit model
     val model = kmeansOp.fit(data)
@@ -129,30 +132,31 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     info("Fit and transform test passed")
   }
 
-  test("KMeansOperation - cosine distance") {
+  test("KMeansOperation - k-means++ initialization") {
     val sparkSession = spark
     import sparkSession.implicits._
 
     val data = Seq(
-      Tuple1(Vectors.dense(1.0, 0.0)),
-      Tuple1(Vectors.dense(0.9, 0.1)),
-      Tuple1(Vectors.dense(0.0, 1.0)),
-      Tuple1(Vectors.dense(0.1, 0.9))
+      Tuple1(Array(1.0f, 0.0f)),
+      Tuple1(Array(0.9f, 0.1f)),
+      Tuple1(Array(0.0f, 1.0f)),
+      Tuple1(Array(0.1f, 0.9f))
     ).toDF("features")
 
     val kmeansOp = new KMeansOperation(
       k = 2,
       maxIter = 20,
-      distanceMeasure = "cosine"
+      initMode = "k-means||"
     )
 
-    val result = kmeansOp.transform(data)
+    val model = kmeansOp.fit(data)
+    val result = model.transform(data)
 
     assert(result.columns.contains("cluster_id"))
     val numClusters = result.select("cluster_id").distinct().count()
     assert(numClusters == 2)
 
-    info("Cosine distance test passed")
+    info("K-means++ initialization test passed")
   }
 
   test("MiniBatchKMeansOperation - basic clustering") {
@@ -166,20 +170,21 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
 
     val data = (0 until numPoints).map { i =>
       val clusterId = i % k
-      val base = clusterId * 10.0
-      val values = Array.fill(dim)(base + scala.util.Random.nextGaussian())
-      Tuple1(Vectors.dense(values))
+      val base = clusterId * 10.0f
+      val values = Array.fill(dim)(base + scala.util.Random.nextGaussian().toFloat)
+      Tuple1(values)
     }.toDF("features")
 
     val minibatchOp = new MiniBatchKMeansOperation(
       k = k,
       batchSize = 0.1,
       numBatches = 5,
-      maxIterPerBatch = 10,
-      featuresCol = "features"
+      featuresCol = "features",
+      initMode = "random"
     )
 
-    val result = minibatchOp.transform(data)
+    val model = minibatchOp.fit(data)
+    val result = model.transform(data)
 
     assert(result.columns.contains("cluster_id"))
     assert(result.count() == numPoints)
@@ -195,18 +200,19 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     import sparkSession.implicits._
 
     val data = (0 until 500).map { i =>
-      val values = Array.fill(8)(scala.util.Random.nextDouble())
-      Tuple1(Vectors.dense(values))
+      val values = Array.fill(8)(scala.util.Random.nextFloat())
+      Tuple1(values)
     }.toDF("features")
 
     val minibatchOp = new MiniBatchKMeansOperation(
       k = 10,
       batchSize = 0.05,  // Very small batches
       numBatches = 20,
-      maxIterPerBatch = 5
+      initMode = "random"
     )
 
-    val result = minibatchOp.transform(data)
+    val model = minibatchOp.fit(data)
+    val result = model.transform(data)
 
     assert(result.columns.contains("cluster_id"))
     assert(result.count() == 500)
@@ -219,19 +225,21 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     import sparkSession.implicits._
 
     val data = Seq(
-      Tuple1(Vectors.dense(0.0, 0.0)),
-      Tuple1(Vectors.dense(1.0, 1.0)),
-      Tuple1(Vectors.dense(5.0, 5.0))
+      Tuple1(Array(0.0f, 0.0f)),
+      Tuple1(Array(1.0f, 1.0f)),
+      Tuple1(Array(5.0f, 5.0f))
     ).toDF("embedding")
 
     val kmeansOp = new KMeansOperation(
       k = 2,
       maxIter = 20,
       featuresCol = "embedding",
-      predictionCol = "my_cluster"
+      predictionCol = "my_cluster",
+      initMode = "random"
     )
 
-    val result = kmeansOp.transform(data)
+    val model = kmeansOp.fit(data)
+    val result = model.transform(data)
 
     assert(result.columns.contains("my_cluster"))
     assert(!result.columns.contains("cluster_id"))
@@ -239,21 +247,22 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     info("Custom column names test passed")
   }
 
-  test("KMeansOperation - validation error on missing column") {
+  test("KMeansOperation - validation error on wrong type") {
     val sparkSession = spark
     import sparkSession.implicits._
 
+    // Create data with wrong type (Double instead of Float)
     val data = Seq(
-      Tuple1(Vectors.dense(0.0, 0.0))
+      Tuple1(Array(0.0, 0.0))
     ).toDF("features")
 
     val kmeansOp = new KMeansOperation(
       k = 2,
-      featuresCol = "nonexistent"
+      featuresCol = "features"
     )
 
     assertThrows[IllegalArgumentException] {
-      kmeansOp.transform(data)
+      kmeansOp.fit(data)
     }
 
     info("Validation error test passed")
@@ -270,17 +279,18 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
     info(s"Generating $numPoints points with $dim dimensions")
 
     val data = (0 until numPoints).map { i =>
-      val values = Array.fill(dim)(scala.util.Random.nextDouble())
-      Tuple1(Vectors.dense(values))
+      val values = Array.fill(dim)(scala.util.Random.nextFloat())
+      Tuple1(values)
     }.toDF("features")
 
     data.cache()
 
     // Standard K-Means
     info("Running standard K-Means...")
-    val kmeansOp = new KMeansOperation(k = k, maxIter = 50)
+    val kmeansOp = new KMeansOperation(k = k, maxIter = 50, initMode = "random")
     val kmeansStart = System.currentTimeMillis()
-    val kmeansResult = kmeansOp.transform(data)
+    val kmeansModel = kmeansOp.fit(data)
+    val kmeansResult = kmeansModel.transform(data)
     kmeansResult.count()  // Trigger computation
     val kmeansTime = (System.currentTimeMillis() - kmeansStart) / 1000.0
     info(s"Standard K-Means time: ${kmeansTime}s")
@@ -291,10 +301,11 @@ class KMeansOperationTest extends AnyFunSuite with BeforeAndAfterAll {
       k = k,
       batchSize = 0.1,
       numBatches = 10,
-      maxIterPerBatch = 5
+      initMode = "random"
     )
     val minibatchStart = System.currentTimeMillis()
-    val minibatchResult = minibatchOp.transform(data)
+    val minibatchModel = minibatchOp.fit(data)
+    val minibatchResult = minibatchModel.transform(data)
     minibatchResult.count()  // Trigger computation
     val minibatchTime = (System.currentTimeMillis() - minibatchStart) / 1000.0
     info(s"Mini-Batch K-Means time: ${minibatchTime}s")

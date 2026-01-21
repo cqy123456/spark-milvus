@@ -17,8 +17,15 @@ import org.apache.log4j.{LogManager, Logger}
  *   # First convert HDF5 to Parquet format:
  *   python scripts/convert_hdf5_to_parquet.py
  *
- *   # Then run benchmark:
+ *   # Run benchmark (Mini-Batch K-Means only, default):
  *   spark-submit --class com.zilliz.spark.connector.benchmarks.Sift1MBenchmark \
+ *     --driver-memory 12g \
+ *     --executor-memory 12g \
+ *     target/scala-2.13/spark-connector-assembly-*.jar \
+ *     [path/to/parquet/directory]
+ *
+ *   # Run benchmark with MLlib K-Means comparison:
+ *   BENCHMARK_RUN_MLLIB=true spark-submit --class com.zilliz.spark.connector.benchmarks.Sift1MBenchmark \
  *     --driver-memory 12g \
  *     --executor-memory 12g \
  *     target/scala-2.13/spark-connector-assembly-*.jar \
@@ -28,23 +35,43 @@ object Sift1MBenchmark {
 
   private val logger: Logger = LogManager.getLogger(this.getClass)
 
-  // Configuration
-  val nlist = 1024  // Number of clusters (IVF index parameter)
-  val nprobe = 32   // Number of clusters to search for recall calculation
-  val dim = 128     // SIFT feature dimension
+  // Configuration - read from environment variables with defaults
+  val nlist = sys.env.get("BENCHMARK_K").map(_.toInt).getOrElse(1024)  // Number of clusters (IVF index parameter)
+  val nprobe = sys.env.get("BENCHMARK_NPROBE").map(_.toInt).getOrElse(32)   // Number of clusters to search for recall calculation
+  val dim = sys.env.get("BENCHMARK_DIM").map(_.toInt).getOrElse(128)     // Feature dimension
+  val initMode = sys.env.get("BENCHMARK_INIT_MODE").getOrElse("random")  // Initialization mode: "random" or "k-means||"
+  val runMllib = sys.env.get("BENCHMARK_RUN_MLLIB").map(_.toBoolean).getOrElse(false)  // Whether to run MLlib K-Means (default: false, only MiniBatch)
+
+  // Dataset configuration from environment variables
+  val dataset = sys.env.get("BENCHMARK_DATASET").getOrElse("sift")
+  val metric = dataset match {
+    case "sift" | "gist" => "euclidean"
+    case "glove" => "angular"
+    case _ => "euclidean"
+  }
+  
+  // Helper function to construct parquet file paths
+  def getParquetPath(parquetDir: String, fileType: String): String = {
+    fileType match {
+      case "train" => s"$parquetDir/$dataset-$dim-$metric-train.parquet"
+      case "test" => s"$parquetDir/$dataset-$dim-$metric-test.parquet"
+      case "groundtruth" | "neighbors" => s"$parquetDir/$dataset-$dim-$metric-neighbors.parquet"
+      case _ => throw new IllegalArgumentException(s"Unknown file type: $fileType")
+    }
+  }
 
   def main(args: Array[String]): Unit = {
     logger.info("========== SIFT1M Benchmark Starting ==========")
-    logger.info(s"Configuration: nlist=$nlist, nprobe=$nprobe, dim=$dim")
+    logger.info(s"Configuration: nlist=$nlist, nprobe=$nprobe, dim=$dim, initMode=$initMode, runMllib=$runMllib")
 
     // Get Parquet directory path from arguments or use default
     val parquetDir = if (args.nonEmpty) args(0) else "./data/parquet"
     logger.info(s"Parquet directory: $parquetDir")
 
     // Check if Parquet files exist
-    val trainPath = s"$parquetDir/sift1m-train.parquet"
-    val testPath = s"$parquetDir/sift1m-test.parquet"
-    val gtPath = s"$parquetDir/sift1m-groundtruth.parquet"
+    val trainPath = getParquetPath(parquetDir, "train")
+    val testPath = getParquetPath(parquetDir, "test")
+    val gtPath = getParquetPath(parquetDir, "neighbors")
 
     logger.info("Checking Parquet files existence...")
     logger.info(s"  Train: $trainPath -> ${Files.exists(Paths.get(trainPath))}")
@@ -110,7 +137,8 @@ object Sift1MBenchmark {
   def runBenchmark(spark: SparkSession, parquetDir: String): Unit = {
     logger.info("runBenchmark() started")
     println("=" * 80)
-    println("SIFT1M Benchmark: K-Means vs Mini-Batch K-Means")
+    val title = if (runMllib) "SIFT1M Benchmark: K-Means vs Mini-Batch K-Means" else "SIFT1M Benchmark: Mini-Batch K-Means"
+    println(title)
     println("=" * 80)
 
     // Load test data and ground truth (small datasets, can fit in driver)
@@ -120,8 +148,8 @@ object Sift1MBenchmark {
 
     // Load training data from Parquet (distributed by default)
     logger.info("Loading training data from Parquet...")
-    val trainPath = s"$parquetDir/sift1m-train.parquet"
-    val trainDF = spark.read.parquet(trainPath)
+    val trainPath = getParquetPath(parquetDir, "train")
+    val trainDF = spark.read.parquet(trainPath).select("features")
 
     // Verify Array[Float] format
     import org.apache.spark.sql.types._
@@ -159,13 +187,13 @@ object Sift1MBenchmark {
     println("Testing Mini-Batch K-Means...")
     println("=" * 80)
 
-    logger.info(s"Creating MiniBatchKMeansOperation with k=$nlist, batchSize=0.1, numBatches=10")
+    logger.info(s"Creating MiniBatchKMeansOperation with k=$nlist, batchSize=0.1, numBatches=10, initMode=$initMode")
     val minibatchOp = new MiniBatchKMeansOperation(
       k = nlist,
       batchSize = 0.1,
       numBatches = 10,
       featuresCol = "features",
-      initMode = "random",
+      initMode = initMode,
       predictionCol = "cluster_id"
     )
 
@@ -213,70 +241,79 @@ object Sift1MBenchmark {
     logger.info(f"Mini-Batch K-Means Recall@1 (nprobe=$nprobe): $minibatchRecall%.4f (${minibatchRecall * 100}%.2f%%)")
 
     // ============================================================================
-    // Test 1: Standard K-Means
+    // Test 1: MLlib K-Means (Standard Implementation) - OPTIONAL
     // ============================================================================
-    logger.info("========== Test 1: Standard K-Means ==========")
-    println("\n" + "=" * 80)
-    println("Testing Standard K-Means...")
-    println("=" * 80)
+    val (kmeansTrainTime, kmeansAssignTime, kmeansLoss, kmeansRecall, kmeansResult) = if (runMllib) {
+      logger.info("========== Test 1: MLlib K-Means ==========")
+      println("\n" + "=" * 80)
+      println("Testing MLlib K-Means (Standard Implementation)...")
+      println("=" * 80)
 
-    logger.info(s"Creating KMeansOperation with k=$nlist, maxIter=10")
-    val kmeansOp = new MLlibKMeansOperation(
-      k = nlist,
-      maxIter = 10,
-      featuresCol = "features",
-      initMode = "random",
-      predictionCol = "cluster_id"
-    )
+      logger.info(s"Creating MLlibKMeansOperation with k=$nlist, maxIter=10, initMode=$initMode")
+      val kmeansOp = new MLlibKMeansOperation(
+        k = nlist,
+        maxIter = 10,
+        featuresCol = "features",
+        initMode = initMode,
+        predictionCol = "cluster_id"
+      )
 
-     // Training time
-    println("Training Mini-Batch K-Means model...")
-    logger.info("Starting Mini-Batch K-Means training...")
-    val kmeansTrainStart = System.currentTimeMillis()
-    val kmeansModel = kmeansOp.fit(trainDF)
-    val kmeansTrainTime = (System.currentTimeMillis() - kmeansTrainStart) / 1000.0
-    println(f"✓ Training time: $kmeansTrainTime%.2f seconds")
-    logger.info(f"Mini-Batch K-Means training completed in $kmeansTrainTime%.2f seconds")
+      // Training time
+      println("Training MLlib K-Means model...")
+      logger.info("Starting MLlib K-Means training...")
+      val kmeansTrainStart = System.currentTimeMillis()
+      val kmeansModel = kmeansOp.fit(trainDF)
+      val kmeansTrainTime = (System.currentTimeMillis() - kmeansTrainStart) / 1000.0
+      println(f"✓ Training time: $kmeansTrainTime%.2f seconds")
+      logger.info(f"MLlib K-Means training completed in $kmeansTrainTime%.2f seconds")
 
-    // Assignment time
-    println("Assigning vectors to clusters...")
-    logger.info("Starting Mini-Batch K-Means cluster assignment...")
-    val kmeansAssignStart = System.currentTimeMillis()
-    // Use kmeansOp.transform() instead of model.transform() for Array[Float] support
-    val kmeansResult = kmeansModel.transform(trainDF)
-    kmeansResult.cache()
-    val kmeansAssignmentCount = kmeansResult.count()
-    val kmeansAssignTime = (System.currentTimeMillis() - kmeansAssignStart) / 1000.0
-    println(f"✓ Assignment time: $kmeansAssignTime%.2f seconds")
-    logger.info(f"Mini-Batch K-Means assignment completed in $kmeansAssignTime%.2f seconds, assigned $kmeansAssignmentCount vectors")
+      // Assignment time
+      println("Assigning vectors to clusters...")
+      logger.info("Starting MLlib K-Means cluster assignment...")
+      val kmeansAssignStart = System.currentTimeMillis()
+      // Use model.transform() for MLlib KMeans
+      val kmeansResult = kmeansModel.transform(trainDF)
+      kmeansResult.cache()
+      val kmeansAssignmentCount = kmeansResult.count()
+      val kmeansAssignTime = (System.currentTimeMillis() - kmeansAssignStart) / 1000.0
+      println(f"✓ Assignment time: $kmeansAssignTime%.2f seconds")
+      logger.info(f"MLlib K-Means assignment completed in $kmeansAssignTime%.2f seconds, assigned $kmeansAssignmentCount vectors")
 
-    // Loss
-    logger.info("Calculating K-Means loss...")
-    val kmeansLoss = calculateLossFloat(kmeansResult, kmeansModel)
-    println(f"✓ K-Means loss (inertia): $kmeansLoss%.2f")
-    logger.info(f"K-Means loss (inertia): $kmeansLoss%.2f")
+      // Loss
+      logger.info("Calculating MLlib K-Means loss...")
+      val kmeansLoss = calculateLossFloat(kmeansResult, kmeansModel)
+      println(f"✓ K-Means loss (inertia): $kmeansLoss%.2f")
+      logger.info(f"MLlib K-Means loss (inertia): $kmeansLoss%.2f")
 
-    // Recall - use training DataFrame
-    logger.info("Collecting K-Means cluster assignments...")
-    val kmeansAssignments = kmeansResult.select("cluster_id").collect().map(_.getInt(0))
-    logger.info(f"Collected ${kmeansAssignments.length} assignments, starting recall calculation...")
-    // Use model.clusterCenters - now both operations return unified KMeansModel
-    val kmeansRecall = calculateRecallFloat(
-      kmeansModel.clusterCenters,
-      trainDF,
-      testVectors,
-      groundTruth,
-      kmeansAssignments,
-      nprobe
-    )
-    println(f"✓ Recall@1 (nprobe=$nprobe): $kmeansRecall%.4f (${kmeansRecall * 100}%.2f%%)")
-    logger.info(f"Mini-Batch K-Means Recall@1 (nprobe=$nprobe): $kmeansRecall%.4f (${kmeansRecall * 100}%.2f%%)")
+      // Recall - use training DataFrame
+      logger.info("Collecting MLlib K-Means cluster assignments...")
+      val kmeansAssignments = kmeansResult.select("cluster_id").collect().map(_.getInt(0))
+      logger.info(f"Collected ${kmeansAssignments.length} assignments, starting recall calculation...")
+      // Use model.clusterCenters
+      val kmeansRecall = calculateRecallFloat(
+        kmeansModel.clusterCenters,
+        trainDF,
+        testVectors,
+        groundTruth,
+        kmeansAssignments,
+        nprobe
+      )
+      println(f"✓ Recall@1 (nprobe=$nprobe): $kmeansRecall%.4f (${kmeansRecall * 100}%.2f%%)")
+      logger.info(f"MLlib K-Means Recall@1 (nprobe=$nprobe): $kmeansRecall%.4f (${kmeansRecall * 100}%.2f%%)")
 
+      // Free training vectors memory after K-Means recall
+      logger.info("Triggering GC after K-Means testing...")
+      System.gc()
+      Thread.sleep(1000)
 
-    // Free training vectors memory after K-Means recall
-    logger.info("Triggering GC after K-Means testing...")
-    System.gc()
-    Thread.sleep(1000)
+      (kmeansTrainTime, kmeansAssignTime, kmeansLoss, kmeansRecall, Some(kmeansResult))
+    } else {
+      logger.info("Skipping MLlib K-Means test (BENCHMARK_RUN_MLLIB=false)")
+      println("\n" + "=" * 80)
+      println("Skipping MLlib K-Means test")
+      println("=" * 80)
+      (0.0, 0.0, 0.0, 0.0, None)
+    }
 
     // ============================================================================
     // Comparison Summary
@@ -288,40 +325,53 @@ object Sift1MBenchmark {
     println(s"Dataset: SIFT1M ($numVectors vectors, $dim dimensions)")
     println(s"Configuration: nlist=$nlist, nprobe=$nprobe")
     println("-" * 80)
-    println(f"${"Metric"}%-40s ${"K-Means"}%15s ${"Mini-Batch"}%15s ${"Speedup"}%10s")
-    println("-" * 80)
 
-    val trainSpeedup = kmeansTrainTime / minibatchTrainTime
-    println(f"${"Training Time (s)"}%-40s ${kmeansTrainTime}%15.2f ${minibatchTrainTime}%15.2f ${trainSpeedup}%9.2fx")
-    logger.info(f"Training speedup: ${trainSpeedup}%.2fx")
+    if (runMllib) {
+      // Comparison mode: show both MLlib and MiniBatch
+      println(f"${"Metric"}%-40s ${"MLlib K-Means"}%15s ${"Mini-Batch"}%15s ${"Speedup"}%10s")
+      println("-" * 80)
 
-    val assignSpeedup = kmeansAssignTime / minibatchAssignTime
-    println(f"${"Assignment Time (s)"}%-40s ${kmeansAssignTime}%15.2f ${minibatchAssignTime}%15.2f ${assignSpeedup}%9.2fx")
-    logger.info(f"Assignment speedup: ${assignSpeedup}%.2fx")
+      val trainSpeedup = kmeansTrainTime / minibatchTrainTime
+      println(f"${"Training Time (s)"}%-40s ${kmeansTrainTime}%15.2f ${minibatchTrainTime}%15.2f ${trainSpeedup}%9.2fx")
+      logger.info(f"Training speedup: ${trainSpeedup}%.2fx")
 
-    val lossRatio = minibatchLoss / kmeansLoss
-    println(f"${"K-Means Loss (inertia)"}%-40s ${kmeansLoss}%15.2f ${minibatchLoss}%15.2f ${lossRatio}%9.2fx")
-    logger.info(f"Loss ratio (MiniBatch/KMeans): ${lossRatio}%.2fx")
+      val assignSpeedup = kmeansAssignTime / minibatchAssignTime
+      println(f"${"Assignment Time (s)"}%-40s ${kmeansAssignTime}%15.2f ${minibatchAssignTime}%15.2f ${assignSpeedup}%9.2fx")
+      logger.info(f"Assignment speedup: ${assignSpeedup}%.2fx")
 
-    val recallRatio = minibatchRecall / kmeansRecall
-    println(f"${"Recall@1 (nprobe=$nprobe)"}%-40s ${kmeansRecall * 100}%14.2f%% ${minibatchRecall * 100}%14.2f%% ${recallRatio}%9.2fx")
-    logger.info(f"Recall ratio (MiniBatch/KMeans): ${recallRatio}%.2fx")
+      val lossRatio = minibatchLoss / kmeansLoss
+      println(f"${"K-Means Loss (inertia)"}%-40s ${kmeansLoss}%15.2f ${minibatchLoss}%15.2f ${lossRatio}%9.2fx")
+      logger.info(f"Loss ratio (MiniBatch/KMeans): ${lossRatio}%.2fx")
 
-    println("-" * 80)
-    println(f"Overall Training Speedup: ${trainSpeedup}%.2fx")
-    val lossDiffPercent = (lossRatio - 1.0) * 100
-    println(f"Loss Difference: ${if (lossDiffPercent > 0) "+" else ""}$lossDiffPercent%.2f%%")
-    logger.info(f"Loss difference: ${if (lossDiffPercent > 0) "+" else ""}$lossDiffPercent%.2f%%")
-    val recallDiffPercent = (recallRatio - 1.0) * 100
-    println(f"Recall Difference: ${if (recallDiffPercent > 0) "+" else ""}$recallDiffPercent%.2f%%")
-    logger.info(f"Recall difference: ${if (recallDiffPercent > 0) "+" else ""}$recallDiffPercent%.2f%%")
+      val recallRatio = minibatchRecall / kmeansRecall
+      println(f"${"Recall@1 (nprobe=$nprobe)"}%-40s ${kmeansRecall * 100}%14.2f%% ${minibatchRecall * 100}%14.2f%% ${recallRatio}%9.2fx")
+      logger.info(f"Recall ratio (MiniBatch/KMeans): ${recallRatio}%.2fx")
+
+      println("-" * 80)
+      println(f"Overall Training Speedup: ${trainSpeedup}%.2fx")
+      val lossDiffPercent = (lossRatio - 1.0) * 100
+      println(f"Loss Difference: ${if (lossDiffPercent > 0) "+" else ""}$lossDiffPercent%.2f%%")
+      logger.info(f"Loss difference: ${if (lossDiffPercent > 0) "+" else ""}$lossDiffPercent%.2f%%")
+      val recallDiffPercent = (recallRatio - 1.0) * 100
+      println(f"Recall Difference: ${if (recallDiffPercent > 0) "+" else ""}$recallDiffPercent%.2f%%")
+      logger.info(f"Recall difference: ${if (recallDiffPercent > 0) "+" else ""}$recallDiffPercent%.2f%%")
+    } else {
+      // Mini-Batch only mode: show only MiniBatch results
+      println(f"${"Metric"}%-40s ${"Mini-Batch K-Means"}%20s")
+      println("-" * 80)
+      println(f"${"Training Time (s)"}%-40s ${minibatchTrainTime}%20.2f")
+      println(f"${"Assignment Time (s)"}%-40s ${minibatchAssignTime}%20.2f")
+      println(f"${"K-Means Loss (inertia)"}%-40s ${minibatchLoss}%20.2f")
+      println(f"${"Recall@1 (nprobe=$nprobe)"}%-40s ${minibatchRecall * 100}%19.2f%%")
+      logger.info(f"Mini-Batch K-Means Results - Train: $minibatchTrainTime%.2fs, Assign: $minibatchAssignTime%.2fs, Loss: $minibatchLoss%.2f, Recall: ${minibatchRecall * 100}%.2f%%")
+    }
     println("=" * 80)
 
     // Cleanup
     logger.info("Unpersisting cached DataFrames...")
     trainDF.unpersist()
-    //kmeansResult.unpersist()
     minibatchResult.unpersist()
+    kmeansResult.foreach(_.unpersist())
     logger.info("runBenchmark() completed")
   }
 
@@ -333,18 +383,18 @@ object Sift1MBenchmark {
     println(s"\nLoading test data from Parquet: $parquetDir")
 
     // Load test vectors
-    val testPath = s"$parquetDir/sift1m-test.parquet"
+    val testPath = getParquetPath(parquetDir, "test")
     logger.info(s"Reading test vectors from: $testPath")
 
     val testVectors = try {
-      val testDF = spark.read.parquet(testPath)
+      val testDF = spark.read.parquet(testPath).select("features")
       logger.info(s"Test DataFrame schema: ${testDF.schema}")
       logger.info(s"Test DataFrame partitions: ${testDF.rdd.getNumPartitions}")
       logger.info(s"Test DataFrame count: ${testDF.count()}")
 
       logger.info("Collecting test vectors...")
       val vectors = testDF.collect().map { row =>
-        // Parquet now stores as Float directly (Array[Float])
+        // Parquet stores as Float directly (Array[Float])
         val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](0).toArray
         features
       }
@@ -358,13 +408,13 @@ object Sift1MBenchmark {
     }
 
     // Load ground truth
-    val gtPath = s"$parquetDir/sift1m-groundtruth.parquet"
+    val gtPath = getParquetPath(parquetDir, "neighbors")
     logger.info(s"Reading ground truth from: $gtPath")
-    val gtDF = spark.read.parquet(gtPath)
+    val gtDF = spark.read.parquet(gtPath).select("neighbors")
     logger.info("Collecting ground truth...")
     val groundTruth = gtDF.collect().map { row =>
-      // Parquet stores as long for integers, convert to int
-      val neighbors = row.getAs[Seq[Long]](0).map(_.toInt).toArray
+      // Parquet stores neighbors as Array[Int]
+      val neighbors = row.getAs[scala.collection.mutable.WrappedArray[Int]](0).toArray
       neighbors
     }
     println(s"✓ Loaded ${groundTruth.length} ground truth entries with ${groundTruth(0).length} neighbors each")
@@ -553,6 +603,7 @@ object Sift1MBenchmark {
 
   /**
    * Calculate Recall@1 using IVF-like search with Float centers
+   * Optimized version: distributed computation to avoid OOM on driver
    */
   def calculateRecallFloat(
       clusterCenters: Array[Array[Float]],
@@ -563,89 +614,171 @@ object Sift1MBenchmark {
       nprobe: Int
   ): Double = {
     logger.info(s"calculateRecallFloat() called with nprobe=$nprobe")
+    logger.info(s"clusterCenters: ${clusterCenters.length}, testVectors: ${testVectors.length}")
+    println(s"\nCalculating Recall@1 with nprobe=$nprobe (distributed mode)...")
 
-    // Extract training vectors as Float arrays from DataFrame
-    logger.info("Extracting training vectors from DataFrame as Float arrays...")
-    val trainVectors = trainDF.collect().map { row =>
-      // trainDF contains Array[Float], Spark returns it as mutable.WrappedArray
-      row.getAs[scala.collection.mutable.WrappedArray[Float]](0).toArray
-    }
-
-    logger.info(s"clusterCenters: ${clusterCenters.length}, trainVectors: ${trainVectors.length}, testVectors: ${testVectors.length}")
-    println(s"\nCalculating Recall@1 with nprobe=$nprobe...")
-
-    var correctCount = 0
+    val spark = trainDF.sparkSession
     val numQueries = testVectors.length
 
-    // Build inverted index
-    logger.info("Building inverted index...")
-    val invertedIndex = Array.fill(clusterCenters.length)(scala.collection.mutable.ArrayBuffer[Int]())
+    // Build inverted index: cluster_id -> set of vector indices for O(1) lookup
+    logger.info("Building inverted index from cluster assignments...")
+    val invertedIndex = Array.fill(clusterCenters.length)(scala.collection.mutable.HashSet[Int]())
     for (i <- clusterAssignments.indices) {
       invertedIndex(clusterAssignments(i)) += i
     }
-    val clusterSizes = invertedIndex.map(_.length)
+    val clusterSizes = invertedIndex.map(_.size)
     logger.info(s"Built inverted index for ${clusterCenters.length} clusters")
     logger.info(s"Cluster sizes - min: ${clusterSizes.min}, max: ${clusterSizes.max}, avg: ${clusterSizes.sum / clusterSizes.length}")
 
-    // Process each query
-    for (queryIdx <- 0 until numQueries) {
-      val query = testVectors(queryIdx)
-      val trueNN = groundTruth(queryIdx)(0) // Ground truth nearest neighbor
+    // Add cluster_id column to training DataFrame for filtering
+    logger.info("Adding cluster assignments to training DataFrame...")
+    import spark.implicits._
 
-      // Compute distances to all cluster centers (Float precision)
-      val clusterDistances = clusterCenters.indices.map { clusterId =>
-        val center = clusterCenters(clusterId)
-        val distance = euclideanDistanceFloat(query, center)
-        (clusterId, distance)
-      }.sortBy(_._2).take(nprobe)
-
-      // Debug logging for first query
-      if (queryIdx == 0) {
-        logger.info(s"Query 0: Selected ${clusterDistances.length} clusters (nprobe=$nprobe)")
-        val trueCluster = clusterAssignments(trueNN)
-        val trueClusterRank = clusterDistances.indexWhere(_._1 == trueCluster)
-        logger.info(f"Query 0: True NN=$trueNN is in cluster=$trueCluster, rank in selected clusters=$trueClusterRank (${if (trueClusterRank >= 0) "FOUND" else "MISSING"})")
-
-        logger.info(f"Query 0 first 5 dims: ${query.take(5).mkString(", ")}")
-        val center0 = clusterCenters(clusterDistances(0)._1)
-        logger.info(f"Nearest cluster center first 5 dims: ${center0.take(5).mkString(", ")}")
-
-        val trainVec0 = trainVectors(0)
-        logger.info(f"Training vector 0 first 5 dims: ${trainVec0.take(5).mkString(", ")}")
-        logger.info("Data type verification: All vectors use Float precision for consistency")
-      }
-
-      // Search within nprobe clusters
-      var bestDistance = Double.MaxValue
-      var bestIdx = -1
-
-      for ((clusterId, _) <- clusterDistances) {
-        for (vecIdx <- invertedIndex(clusterId)) {
-          val trainVec = trainVectors(vecIdx)
-          val distance = euclideanDistanceFloat(query, trainVec)
-
-          if (distance < bestDistance) {
-            bestDistance = distance
-            bestIdx = vecIdx
-          }
-        }
-      }
-
-      // Check if we found the true nearest neighbor
-      if (bestIdx == trueNN) {
-        correctCount += 1
-      }
-
-      // Progress indicator
-      if ((queryIdx + 1) % 1000 == 0 || queryIdx == 0) {
-        print(s"\rProcessed ${queryIdx + 1}/$numQueries queries...")
-      }
+    // Create RDD with (row_index, cluster_id, features) from trainDF
+    // Use zipWithIndex to get sequential 0-based indices that match clusterAssignments array
+    val trainWithIndexRDD = trainDF.rdd.zipWithIndex().map { case (row, idx) =>
+      val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](0).toArray
+      val clusterId = clusterAssignments(idx.toInt)
+      (idx.toInt, clusterId, features)
     }
 
-    println(s"\rProcessed $numQueries/$numQueries queries - Done!")
-    val recall = correctCount.toDouble / numQueries
+    val trainWithCluster = trainWithIndexRDD
+      .toDF("vector_id", "cluster_id", "features")
+      .cache()  // Cache since we'll access it multiple times
+
+    logger.info(s"Training data with clusters: ${trainWithCluster.count()} vectors")
+
+    // Broadcast data for executors
+    val bcCenters = spark.sparkContext.broadcast(clusterCenters)
+    val bcTestVectors = spark.sparkContext.broadcast(testVectors)
+    val bcGroundTruth = spark.sparkContext.broadcast(groundTruth)
+
+    logger.info(s"Processing $numQueries queries in distributed mode...")
+
+    // Process queries in batches to avoid too many small tasks
+    val batchSize = 100
+    val numBatches = (numQueries + batchSize - 1) / batchSize
+    var totalCorrect = 0
+
+    for (batchIdx <- 0 until numBatches) {
+      val startIdx = batchIdx * batchSize
+      val endIdx = Math.min(startIdx + batchSize, numQueries)
+      val queryIndices = (startIdx until endIdx).toArray
+
+      logger.info(s"Processing query batch ${batchIdx + 1}/$numBatches (queries $startIdx to ${endIdx - 1})...")
+
+      // Broadcast query batch
+      val bcQueryBatch = spark.sparkContext.broadcast(queryIndices)
+
+      // Step 1: Find top nprobe clusters for each query (cheap operation)
+      val queryTopClusters = queryIndices.map { queryIdx =>
+        val query = testVectors(queryIdx)
+        val topClusters = clusterCenters.indices.map { clusterId =>
+          val center = clusterCenters(clusterId)
+          var sumSq = 0.0f
+          var i = 0
+          while (i < query.length) {
+            val diff = query(i) - center(i)
+            sumSq += diff * diff
+            i += 1
+          }
+          (clusterId, sumSq)
+        }.sortBy(_._2).take(nprobe).map(_._1).toSet
+        (queryIdx, topClusters)
+      }.toMap
+
+      val bcQueryTopClusters = spark.sparkContext.broadcast(queryTopClusters)
+
+      // Step 2: Filter training data to only relevant clusters and search
+      // OPTIMIZED: Only process vectors in selected clusters
+      val allSelectedClusters = queryTopClusters.values.flatten.toSet
+      val bcSelectedClusters = spark.sparkContext.broadcast(allSelectedClusters)
+
+      val searchResults = trainWithCluster
+        .filter($"cluster_id".isin(allSelectedClusters.toSeq: _*))  // Pre-filter by cluster
+        .rdd
+        .mapPartitions { iter =>
+          val localTestVectors = bcTestVectors.value
+          val localQueryIndices = bcQueryBatch.value
+          val localQueryTopClusters = bcQueryTopClusters.value
+
+          // Collect partition data: (vector_id, cluster_id, features)
+          val partitionData = iter.map { row =>
+            val vectorId = row.getInt(row.fieldIndex("vector_id"))
+            val clusterId = row.getInt(row.fieldIndex("cluster_id"))
+            val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](row.fieldIndex("features")).toArray
+            (vectorId, clusterId, features)
+          }.toArray
+
+          // For each query, search only in its top clusters
+          localQueryIndices.iterator.flatMap { queryIdx =>
+            val query = localTestVectors(queryIdx)
+            val topClusters = localQueryTopClusters(queryIdx)
+
+            // Filter vectors in this partition that belong to top clusters
+            val relevantVectors = partitionData.filter { case (_, clusterId, _) =>
+              topClusters.contains(clusterId)
+            }
+
+            if (relevantVectors.nonEmpty) {
+              // Find best match in this partition
+              var bestDistance = Float.MaxValue
+              var bestVectorId = -1
+
+              relevantVectors.foreach { case (vectorId, _, trainVec) =>
+                var sumSq = 0.0f
+                var i = 0
+                while (i < query.length) {
+                  val diff = query(i) - trainVec(i)
+                  sumSq += diff * diff
+                  i += 1
+                }
+                val dist = Math.sqrt(sumSq).toFloat
+
+                if (dist < bestDistance) {
+                  bestDistance = dist
+                  bestVectorId = vectorId  // Store the actual vector ID!
+                }
+              }
+
+              Some((queryIdx, bestVectorId, bestDistance))
+            } else {
+              None
+            }
+          }
+        }.collect()
+
+      bcQueryBatch.destroy()
+      bcQueryTopClusters.destroy()
+      bcSelectedClusters.destroy()
+
+      // Aggregate results: find global best for each query
+      val queryResults = searchResults.groupBy(_._1).map { case (queryIdx, candidates) =>
+        val (_, bestVecId, _) = candidates.minBy(_._3)
+        (queryIdx, bestVecId)
+      }
+
+      // Count correct predictions
+      val batchCorrect = queryResults.count { case (queryIdx, predictedIdx) =>
+        predictedIdx == groundTruth(queryIdx)(0)
+      }
+
+      totalCorrect += batchCorrect
+
+      logger.info(s"Batch ${batchIdx + 1}/$numBatches: ${batchCorrect}/${endIdx - startIdx} correct")
+      println(s"Processed queries $startIdx-${endIdx - 1}: ${batchCorrect}/${endIdx - startIdx} correct")
+    }
+
+    // Cleanup broadcasts
+    bcCenters.destroy()
+    bcTestVectors.destroy()
+    bcGroundTruth.destroy()
+    trainWithCluster.unpersist()
+
+    println(s"\rProcessed $numQueries queries - Done!")
+    val recall = totalCorrect.toDouble / numQueries
     println(f"Recall@1 (nprobe=$nprobe): $recall%.4f (${recall * 100}%.2f%%)")
-    logger.info(f"Recall calculation completed: $correctCount correct out of $numQueries queries, recall=$recall%.4f")
+    logger.info(f"Recall calculation completed: $totalCorrect correct out of $numQueries queries, recall=$recall%.4f")
 
     recall
   }

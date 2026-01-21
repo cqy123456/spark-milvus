@@ -1,6 +1,8 @@
 package com.zilliz.spark.connector.operations.clustering
 
 import com.zilliz.spark.connector.utils.VectorOps
+import org.apache.spark.ml.clustering.{KMeans => MLlibKMeans}
+import org.apache.spark.ml.linalg.Vectors
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{ArrayType, DataTypes, FloatType, StructField}
@@ -137,7 +139,7 @@ class MiniBatchKMeansOperation(
       val broadcastCenters = spark.sparkContext.broadcast(centers)
 
       // Compute cluster statistics using mapPartitions + reduceByKey
-      // Similar to KMeansOperation and MLlib KMeans for better performance
+      // MEMORY OPTIMIZED: Process in sub-batches to avoid loading entire partition into memory
       val clusterStatsRDD = batch.rdd.mapPartitions { iter =>
         val localCenters = broadcastCenters.value
         val dim = localCenters(0).length
@@ -145,16 +147,40 @@ class MiniBatchKMeansOperation(
           (new Array[Float](dim), 0)
         )
 
-        iter.foreach { row =>
-          val features = row.getAs[Seq[Float]](featuresCol).toArray
-          val closestCluster = findClosestClusterFloat(features, localCenters)
+        // MEMORY OPTIMIZATION: Process partition in sub-batches to limit peak memory
+        // This prevents OOM when partition contains too many points
+        val subBatchSize = 5000  // Process 5000 points at a time
+        val partitionIter = iter.map { row =>
+          row.getAs[Seq[Float]](featuresCol).toArray
+        }
 
-          // Accumulate sum and count
-          val (sum, count) = localStats(closestCluster)
-          for (i <- features.indices) {
-            sum(i) += features(i)
+        while (partitionIter.hasNext) {
+          // Collect sub-batch
+          val subBatch = partitionIter.take(subBatchSize).toArray
+
+          if (subBatch.nonEmpty) {
+            // OPTIMIZED: Find nearest center for each point using ND4J with SIMD
+            // findNearestTargets uses adaptive batch size to prevent OOM
+            val nearestCenters = VectorOps.findNearestTargets(subBatch, localCenters)
+
+            // Assign each point to closest cluster and accumulate stats
+            var i = 0
+            while (i < subBatch.length) {
+              val (closestCluster, minDist) = nearestCenters(i)
+
+              // Accumulate sum and count
+              val (sum, count) = localStats(closestCluster)
+              val point = subBatch(i)
+              var k = 0
+              while (k < dim) {
+                sum(k) += point(k)
+                k += 1
+              }
+              localStats(closestCluster) = (sum, count + 1)
+
+              i += 1
+            }
           }
-          localStats(closestCluster) = (sum, count + 1)
         }
 
         // Emit (clusterId, stats) pairs - only for non-empty clusters
@@ -277,86 +303,52 @@ class MiniBatchKMeansOperation(
   }
 
   /**
-   * K-Means++ initialization: simplified version for mini-batch
-   * Selects k centers using distance-weighted sampling
+   * K-Means++ initialization using MLlib's k-means|| algorithm
+   *
+   * MLlib's k-means|| is a distributed, scalable version of k-means++ that:
+   * 1. Runs in O(log n) rounds instead of O(k) sequential iterations
+   * 2. Samples ~k candidates per round in parallel across the cluster
+   * 3. Much more efficient for large k values
+   *
+   * We run MLlib KMeans with maxIter=0 to only perform initialization,
+   * then extract the initialized centers for our mini-batch training.
    */
   private def initializeKMeansPlusPlus(
     df: DataFrame,
     k: Int,
     seed: Long
   ): Array[Array[Float]] = {
-    val spark = df.sparkSession
-    val rand = new scala.util.Random(seed)
+    logger.info(s"Using MLlib k-means|| for initialization (k=$k)")
 
-    // Select first center randomly
-    val firstCenter = df.sample(false, 0.01, seed)
-      .limit(1)
-      .select(featuresCol)
-      .collect()
-      .head
-      .getAs[Seq[Float]](0)
-      .toArray
+    // Convert Array[Float] to Vector[Double] for MLlib
+    val toVector = udf((arr: Seq[Float]) => {
+      Vectors.dense(arr.map(_.toDouble).toArray)
+    })
 
-    var centers = Array(firstCenter)
-    logger.info(s"K-means++ initialization: selected first center")
+    val vectorDF = df.withColumn("__mllib_init_features", toVector(col(featuresCol)))
+    vectorDF.cache()
 
-    // Iteratively select remaining k-1 centers
-    for (step <- 1 until k) {
-      val bcCenters = spark.sparkContext.broadcast(centers)
+    // Use MLlib KMeans with maxIter=1 to get k-means|| initialized centers
+    // initSteps controls the number of k-means|| rounds (default 2, we use 5 for better quality)
+    val mllibKMeans = new MLlibKMeans()
+      .setK(k)
+      .setMaxIter(initMaxIter)  // Use the configured initMaxIter (default 1)
+      .setSeed(seed)
+      .setInitMode("k-means||")
+      .setInitSteps(5)  // More steps for better initialization quality
+      .setFeaturesCol("__mllib_init_features")
+      .setPredictionCol("__mllib_init_pred")
 
-      // Compute squared distances to nearest center
-      val costs = df.select(featuresCol).rdd.map { row =>
-        val point = row.getAs[Seq[Float]](0).toArray
-        var minDist = Float.MaxValue
-        for (center <- bcCenters.value) {
-          val dist = squaredDistanceFloat(point, center)
-          if (dist < minDist) {
-            minDist = dist
-          }
-        }
-        (point, minDist)
-      }.persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK_SER)
+    val mllibModel = mllibKMeans.fit(vectorDF)
 
-      // Use treeAggregate to compute total cost in parallel
-      val totalCost = costs.treeAggregate(0.0)(
-        seqOp = (sum, pointCost) => sum + pointCost._2,
-        combOp = (sum1, sum2) => sum1 + sum2,
-        depth = 2
-      )
-
-      // Sample new center proportional to squared distance
-      val threshold = rand.nextDouble() * totalCost
-      var cumulative = 0.0
-      var newCenter: Array[Float] = null
-
-      costs.toLocalIterator.foreach { case (point, cost) =>
-        if (newCenter == null) {
-          cumulative += cost
-          if (cumulative >= threshold) {
-            newCenter = point
-          }
-        }
-      }
-
-      costs.unpersist()
-      bcCenters.destroy()
-
-      if (newCenter != null) {
-        centers = centers :+ newCenter
-        logger.info(s"K-means++ initialization: selected center ${step + 1}/$k")
-      } else {
-        logger.warn(s"K-means++ initialization: failed to select center ${step + 1}, using random fallback")
-        val randomPoint = df.sample(false, 0.01, seed + step)
-          .limit(1)
-          .select(featuresCol)
-          .collect()
-          .head
-          .getAs[Seq[Float]](0)
-          .toArray
-        centers = centers :+ randomPoint
-      }
+    // Convert Vector[Double] centers back to Array[Float]
+    val centers = mllibModel.clusterCenters.map { vector =>
+      vector.toArray.map(_.toFloat)
     }
 
+    vectorDF.unpersist()
+
+    logger.info(s"MLlib k-means|| initialization completed: ${centers.length} centers")
     centers
   }
 }

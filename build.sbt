@@ -29,7 +29,7 @@ ThisBuild / organizationName := "zilliz"
 ThisBuild / organizationHomepage := Some(url("https://zilliz.com/"))
 // For cross-compiling (if applicable)
 // crossScalaVersions := Seq("2.12.x", "2.13.x")
-ThisBuild / scalaVersion := "2.12.18"
+ThisBuild / scalaVersion := "2.13.14"  // Spark 4.0 requires Scala 2.13
 ThisBuild / description := "Milvus Spark Connector to use in Spark ETLs to populate a Milvus vector database."
 ThisBuild / versionScheme := Some("early-semver")
 
@@ -71,7 +71,6 @@ ThisBuild / developers := List(
 )
 
 lazy val root = (project in file("."))
-  .aggregate(benchmarks)
   .settings(
     name := "spark-connector",
     assembly / parallelExecution := true,
@@ -120,8 +119,8 @@ lazy val root = (project in file("."))
     ),
 
     // Add milvus-storage JNI library as unmanaged dependency
-    Compile / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.12" / "milvus-storage-jni-test_2.12-0.1.0-SNAPSHOT.jar",
-    Test / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.12" / "milvus-storage-jni-test_2.12-0.1.0-SNAPSHOT.jar",
+    Compile / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.13" / "milvus-storage-jni-test_2.13-0.1.0-SNAPSHOT.jar",
+    Test / unmanagedJars += baseDirectory.value / "milvus-storage" / "java" / "target" / "scala-2.13" / "milvus-storage-jni-test_2.13-0.1.0-SNAPSHOT.jar",
 
     libraryDependencies ++= Seq(
       munit % Test,
@@ -147,13 +146,9 @@ lazy val root = (project in file("."))
       arrowMemoryCore,
       arrowMemoryNetty,
       arrowCData,
-      hdf5,  // For SIFT1M benchmark
-      graphframes,  // For graph processing
-      nd4jNative  // ND4J for optimized vector operations (CPU backend with SIMD)
+      // graphframes removed - not available for Spark 4.0
+      nd4jNative
     ),
-
-    // Add SciJava repository for HDF5 library
-    resolvers += "SciJava Public" at "https://maven.scijava.org/content/groups/public/",
 
     Compile / PB.protoSources += baseDirectory.value / "milvus-proto/proto",
     Compile / PB.targets := Seq(
@@ -177,49 +172,27 @@ lazy val root = (project in file("."))
     addArtifact(assembly / artifact, assembly)
   )
 
-lazy val benchmarks = (project in file("benchmarks"))
-  .dependsOn(root)
-  .settings(
-    name := "spark-connector-benchmarks",
-    version := "0.2.1-SNAPSHOT",
-    organization := "com.zilliz",
-    scalaVersion := "2.12.18",
+// Filter out problematic files during assembly to avoid shading errors
+assembly / assemblyExcludedJars := {
+  val cp = (assembly / fullClasspath).value
+  // Don't exclude entire JARs, just filter specific files in merge strategy
+  cp.filter(_ => false)
+}
 
-    // Fork JVM for run
-    run / fork := true,
+// Disable shading to avoid Java 21 class file issues during assembly
+// The shading process uses ASM bytecode library which cannot read Java 21 class files
+// These Java 21 files come from multi-release JARs (Jackson 2.17.x, BouncyCastle, etc.)
+// Protobuf conflicts can be resolved via spark.driver.userClassPathFirst=true
+assembly / assemblyShadeRules := Seq()
 
-    // JVM options for benchmarks
-    run / javaOptions ++= Seq(
-      "-Xss2m",
-      "-Djava.library.path=.",
-      "--add-opens=java.base/java.nio=ALL-UNNAMED"
-    ),
-
-    run / envVars := Map(
-      "LD_PRELOAD" -> (baseDirectory.value / ".." / "src" / "main" / "resources" / "native" / "libmilvus-storage.so").getAbsolutePath
-    ),
-
-    // Include main project dependencies
-    libraryDependencies ++= Seq(
-      sparkCore,
-      sparkSql,
-      sparkMLlib,
-      hdf5
-    ),
-
-    // Add milvus-storage JNI library
-    Compile / unmanagedJars += baseDirectory.value / ".." / "milvus-storage" / "java" / "target" / "scala-2.12" / "milvus-storage-jni-test_2.12-0.1.0-SNAPSHOT.jar",
-
-    // Inherit root project's assembly JAR for running benchmarks
-    Compile / run / fullClasspath := (Compile / run / fullClasspath).value
-  )
-
-assembly / assemblyShadeRules := Seq(
-  ShadeRule.rename("com.google.protobuf.**" -> "shade_proto.@1").inAll,
-  ShadeRule.rename("com.google.common.**" -> "shade_googlecommon.@1").inAll
-  // Note: Arrow cannot be shaded due to JNI bindings with hardcoded class names
-  // Use spark.driver.userClassPathFirst=true to prioritize our Arrow version
-)
+// If shading is needed in the future, upgrade sbt-assembly to version that supports Java 21
+// Original shading rules (disabled for now):
+// assembly / assemblyShadeRules := Seq(
+//   ShadeRule.rename("com.google.protobuf.**" -> "shade_proto.@1").inAll,
+//   ShadeRule.rename("com.google.common.**" -> "shade_googlecommon.@1").inAll
+//   // Note: Arrow cannot be shaded due to JNI bindings with hardcoded class names
+//   // Use spark.driver.userClassPathFirst=true to prioritize our Arrow version
+// )
 
 assembly / assemblyMergeStrategy := {
   case PathList("native", xs @ _*) => MergeStrategy.first
@@ -250,11 +223,86 @@ assembly / assemblyMergeStrategy := {
   // Handle @nowarn annotation conflicts between scala-library and scala-collection-compat
   case PathList("scala", "annotation", "nowarn.class") => MergeStrategy.first
   case PathList("scala", "annotation", "nowarn$.class") => MergeStrategy.first
+  // Handle javax.annotation conflicts between jsr305 and nd4j guava
+  case PathList("javax", "annotation", xs @ _*) => MergeStrategy.first
+  // Discard Java multi-release jar entries (versions 11, 17, 21) to avoid conflicts
+  case PathList("META-INF", "versions", _, xs @ _*) => MergeStrategy.first
+  // Handle protobuf conflicts between protobuf-java and nd4j protobuf
+  case PathList("google", "protobuf", xs @ _*) if xs.last.endsWith(".proto") => MergeStrategy.first
+  // Handle guava conflicts with nd4j protobuf (publicsuffix classes)
+  case PathList("com", "google", "thirdparty", "publicsuffix", xs @ _*) => MergeStrategy.first
+  // Handle META-INF native-image conflicts from JavaCPP and ND4J
+  case PathList("META-INF", "native-image", _*) => MergeStrategy.first
   // Default case
   case x =>
     val oldStrategy = (ThisBuild / assemblyMergeStrategy).value
     oldStrategy(x)
 }
+
+lazy val benchmarks = (project in file("benchmarks"))
+  .dependsOn(root % "compile->compile;test->test")
+  .settings(
+    name := "spark-connector-benchmarks",
+    version := "0.2.1-SNAPSHOT",
+    organization := "com.zilliz",
+    scalaVersion := "2.13.14",  // Match root project for Spark 4.0
+
+    // Fork JVM for run
+    run / fork := true,
+
+    // JVM options for benchmarks
+    run / javaOptions ++= Seq(
+      "-Xss2m",
+      "-Djava.library.path=.",
+      "--add-opens=java.base/java.nio=ALL-UNNAMED"
+    ),
+
+    run / envVars := Map(
+      "LD_PRELOAD" -> (baseDirectory.value / ".." / "src" / "main" / "resources" / "native" / "libmilvus-storage.so").getAbsolutePath
+    ),
+
+    // Include main project dependencies
+    libraryDependencies ++= Seq(
+      sparkCore,
+      sparkSql,
+      sparkMLlib
+    ),
+
+    // milvus-storage JNI disabled for Scala 2.13
+    // Compile / unmanagedJars += baseDirectory.value / ".." / "milvus-storage" / "java" / "target" / "scala-2.13" / "milvus-storage-jni-test_2.13-0.1.0-SNAPSHOT.jar",
+
+    // Inherit root project's assembly JAR for running benchmarks
+    Compile / run / fullClasspath := (Compile / run / fullClasspath).value,
+
+    // Enable assembly for benchmarks subproject
+    assembly / assemblyJarName := s"spark-connector-benchmarks-assembly-${version.value}.jar",
+
+    // Use the same merge strategy as root project
+    assembly / assemblyMergeStrategy := {
+      case PathList("native", xs @ _*) => MergeStrategy.first
+      case PathList("META-INF", "native-image", "io.netty", _*) => MergeStrategy.discard
+      case PathList("META-INF", "io.netty.versions.properties") => MergeStrategy.discard
+      case PathList("mime.types") => MergeStrategy.filterDistinctLines
+      case PathList("META-INF", "FastDoubleParser-NOTICE") => MergeStrategy.discard
+      case PathList("arrow-git.properties") => MergeStrategy.first
+      case x if x.endsWith("module-info.class") => MergeStrategy.discard
+      case PathList("org", "apache", "hadoop", xs @ _*) if xs.last == "package-info.class" => MergeStrategy.first
+      case PathList("software", "amazon", "awssdk", xs @ _*) if xs.last == "VersionInfo.class" => MergeStrategy.first
+      case PathList("scala", "annotation", "nowarn.class") => MergeStrategy.first
+      case PathList("scala", "annotation", "nowarn$.class") => MergeStrategy.first
+      case PathList("javax", "annotation", xs @ _*) => MergeStrategy.first
+      case PathList("META-INF", "versions", "21", xs @ _*) => MergeStrategy.discard
+      case PathList("google", "protobuf", xs @ _*) if xs.last.endsWith(".proto") => MergeStrategy.first
+      case PathList("com", "google", "thirdparty", "publicsuffix", xs @ _*) => MergeStrategy.first
+      case PathList("META-INF", "native-image", _*) => MergeStrategy.first
+      case x =>
+        val oldStrategy = (assembly / assemblyMergeStrategy).value
+        oldStrategy(x)
+    },
+
+    // Disable shading for benchmarks too
+    assembly / assemblyShadeRules := Seq()
+  )
 
 // import scalapb.compiler.Version
 // val grpcJavaVersion =

@@ -10,15 +10,54 @@ import org.apache.spark.HashPartitioner
 import org.slf4j.{Logger, LoggerFactory}
 
 /**
+ * Timing statistics for each step in the deduplication pipeline
+ */
+case class StepTiming(
+  stepName: String,
+  stepNumber: Int,
+  durationSeconds: Double
+)
+
+/**
+ * Complete timing statistics for the deduplication pipeline
+ */
+case class DedupTimingStats(
+  stepTimings: Seq[StepTiming],
+  totalDurationSeconds: Double
+) {
+  def getStepDuration(stepNumber: Int): Option[Double] = {
+    stepTimings.find(_.stepNumber == stepNumber).map(_.durationSeconds)
+  }
+
+  def toMap: Map[String, Double] = {
+    stepTimings.map(s => s"step${s.stepNumber}_${s.stepName}" -> s.durationSeconds).toMap +
+      ("total" -> totalDurationSeconds)
+  }
+
+  override def toString: String = {
+    val sb = new StringBuilder
+    sb.append("=" * 60 + "\n")
+    sb.append("Deduplication Pipeline Timing Statistics\n")
+    sb.append("=" * 60 + "\n")
+    stepTimings.foreach { s =>
+      sb.append(f"  Step ${s.stepNumber}: ${s.stepName}%-30s ${s.durationSeconds}%10.2f sec\n")
+    }
+    sb.append("-" * 60 + "\n")
+    sb.append(f"  Total:${" " * 33}${totalDurationSeconds}%10.2f sec\n")
+    sb.append("=" * 60 + "\n")
+    sb.toString
+  }
+}
+
+/**
  * Vector Deduplication Application
  *
  * Pipeline:
  * 1. KMeans Clustering: Cluster vectors into k groups
- * 2. Repartition by Cluster: Move vectors to executors by cluster_id
- * 3. Sort by Distance: Within each cluster, sort by distance to center
- * 4. Build Threshold Graph: Connect similar vectors (distance < threshold)
- * 5. Find Connected Components: Identify duplicate groups
- * 6. Deduplicate: Keep one representative from each group
+ * 2. Repartition by Cluster: Move vectors to executors by cluster_id, sort by distance
+ * 3. Build Graph + Union-Find: Within each bucket, find similar vectors and compute
+ *    connected components using bucket-local Union-Find (no global iteration needed!)
+ * 4. Deduplicate: Keep one representative from each component
  *
  * Input DataFrame schema:
  *   - id: Long - unique vector ID
@@ -113,7 +152,25 @@ class VectorDedupApp(
    *   - is_representative: true if this vector is the representative of its duplicate group
    *   - component_id: ID of the connected component (duplicate group)
    */
+  // Store the latest timing statistics
+  @transient private var _lastTimingStats: Option[DedupTimingStats] = None
+
+  /**
+   * Get the timing statistics from the last deduplication run
+   */
+  def lastTimingStats: Option[DedupTimingStats] = _lastTimingStats
+
   def deduplicate(df: DataFrame): DataFrame = {
+    val (result, _) = deduplicateWithTiming(df)
+    result
+  }
+
+  /**
+   * Main deduplication pipeline with detailed timing statistics
+   *
+   * @return A tuple of (deduplicated DataFrame, timing statistics)
+   */
+  def deduplicateWithTiming(df: DataFrame): (DataFrame, DedupTimingStats) = {
     logger.info("=" * 80)
     logger.info("Starting Vector Deduplication Pipeline")
     logger.info("=" * 80)
@@ -124,6 +181,8 @@ class VectorDedupApp(
     outputDir.foreach(dir => logger.info(s"Output directory: $dir"))
 
     val spark = df.sparkSession
+    val pipelineStartTime = System.currentTimeMillis()
+    val stepTimings = scala.collection.mutable.ArrayBuffer[StepTiming]()
 
     // Validate input
     validateInput(df)
@@ -132,34 +191,87 @@ class VectorDedupApp(
     logger.info(s"Total input vectors: $totalVectors")
 
     // Step 1: KMeans Clustering
+    var stepStart = System.currentTimeMillis()
     val clusteredDF = performKMeansClustering(df)
     saveKMeansResults(clusteredDF)
+    var stepDuration = (System.currentTimeMillis() - stepStart) / 1000.0
+    stepTimings += StepTiming("KMeans Clustering", 1, stepDuration)
+    logger.info(f"Step 1 (KMeans Clustering) completed in $stepDuration%.2f seconds")
 
     // Step 2: Repartition by Cluster and Sort by Distance
+    // NOTE: For S3 data > disk capacity, avoid .cache() here.
+    //       This prevents writing entire dataset to disk.
+    stepStart = System.currentTimeMillis()
     val sortedDF = repartitionAndSortByClusters(clusteredDF)
+    // Trigger computation without explicit caching
+    sortedDF.count()
+    stepDuration = (System.currentTimeMillis() - stepStart) / 1000.0
+    stepTimings += StepTiming("Repartition & Sort", 2, stepDuration)
+    logger.info(f"Step 2 (Repartition & Sort) completed in $stepDuration%.2f seconds")
 
-    // Step 3: Build Threshold Graph
-    val graphDF = buildThresholdGraph(sortedDF)
-    saveGraphEdges(graphDF)
+    // Step 3: Build Threshold Graph + Find Connected Components + Deduplicate (all in one pass)
+    // This combines graph building, Union-Find, and deduplication into a single mapPartitions.
+    // Since each bucket is independent (no cross-bucket edges), we can:
+    // 1. Run Union-Find locally within each partition
+    // 2. Compute min distance per component locally
+    // 3. Mark representatives directly
+    // All without any shuffle operations!
+    stepStart = System.currentTimeMillis()
+    val dedupedDF = buildGraphFindComponentsAndDeduplicate(sortedDF)
+    dedupedDF.cache()
 
-    // Step 4: Find Connected Components
-    val componentAssignments = findConnectedComponents(graphDF)
+    // Compute statistics
+    val stats = dedupedDF.agg(
+      count("*").as("total"),
+      sum(when(col("is_representative"), 1).otherwise(0)).as("representatives"),
+      countDistinct("component_id").as("components")
+    ).head()
 
-    // Step 5: Deduplicate by Components
-    // Join component assignments back to the sorted vectors
-    val sortedWithComponents = sortedDF.join(componentAssignments, Seq("id"), "left")
-      .na.fill(Map("component_id" -> -1L))  // Vectors with no edges get their own component
+    val total = stats.getAs[Long]("total")
+    val representatives = stats.getAs[Long]("representatives")
+    val componentCount = stats.getAs[Long]("components")
+    val duplicates = total - representatives
+    val deduplicationRate = duplicates.toDouble / total * 100
 
-    val dedupedDF = deduplicateByComponents(sortedWithComponents)
+    stepDuration = (System.currentTimeMillis() - stepStart) / 1000.0
+    stepTimings += StepTiming("Graph + Union-Find + Dedup", 3, stepDuration)
+    logger.info(f"Step 3 (Graph + Union-Find + Dedup) completed in $stepDuration%.2f seconds")
+    logger.info(s"Distinct components: $componentCount")
+
+    // Log deduplication statistics
+    logger.info(s"Deduplication complete:")
+    logger.info(s"  Total vectors: $total")
+    logger.info(s"  Representatives: $representatives")
+    logger.info(s"  Duplicates removed: $duplicates")
+    logger.info(f"  Deduplication rate: $deduplicationRate%.2f%%")
+
+    // Log component size distribution
+    logger.info("Component size distribution:")
+    dedupedDF
+      .groupBy("component_id")
+      .agg(count("*").as("component_size"))
+      .groupBy("component_size")
+      .agg(count("*").as("num_components"))
+      .orderBy("component_size")
+      .show(20, false)
 
     // Save final results
     saveFinalResults(dedupedDF)
 
+    // Unpersist cached DataFrames
+    sortedDF.unpersist()
+    dedupedDF.unpersist()
+
+    val totalDuration = (System.currentTimeMillis() - pipelineStartTime) / 1000.0
+    val timingStats = DedupTimingStats(stepTimings.toSeq, totalDuration)
+    _lastTimingStats = Some(timingStats)
+
     logger.info("=" * 80)
     logger.info("Vector Deduplication Pipeline Completed")
     logger.info("=" * 80)
+    logger.info(timingStats.toString)
 
-    dedupedDF
+    (dedupedDF, timingStats)
   }
 
   /**
@@ -179,6 +291,7 @@ class VectorDedupApp(
     val startTime = System.currentTimeMillis()
 
     // Train KMeans model based on selected algorithm
+    val trainingStartTime = System.currentTimeMillis()
     val model = kmeansAlgorithm match {
       case "standard" =>
         val kmeans = new KMeansOperation(
@@ -203,13 +316,19 @@ class VectorDedupApp(
         logger.info(s"Training mini-batch KMeans with k=$k, sampleRatio=$miniBatchSampleRatio...")
         kmeans.fit(df.select(featuresCol))
     }
+    val trainingTime = (System.currentTimeMillis() - trainingStartTime) / 1000.0
+    logger.info(f"✓ KMeans training completed in $trainingTime%.2f seconds")
 
     // Transform: add cluster_id and distance columns
     logger.info("Assigning cluster IDs and computing distances...")
+    val transformStartTime = System.currentTimeMillis()
     val clusteredDF = model.transform(df)
+    clusteredDF.cache().count()
+    val transformTime = (System.currentTimeMillis() - transformStartTime) / 1000.0
+    logger.info(f"✓ Transform and distance computation completed in $transformTime%.2f seconds")
 
     val clusteringTime = (System.currentTimeMillis() - startTime) / 1000.0
-    logger.info(f"✓ KMeans clustering completed in $clusteringTime%.2f seconds")
+    logger.info(f"✓ KMeans clustering (total) completed in $clusteringTime%.2f seconds")
 
     // Log cluster statistics
     //logClusterStatistics(clusteredDF)
@@ -239,31 +358,15 @@ class VectorDedupApp(
     val clusterCount = df.select("cluster_id").distinct().count().toInt
     logger.info(s"Number of clusters: $clusterCount")
 
-    // Repartition by cluster_id using RDD API for precise control
+    // Use DataFrame API for memory-efficient repartitioning and sorting
+    // This avoids loading entire partitions into memory (unlike RDD toSeq.sortBy)
     logger.info(s"Repartitioning into $clusterCount partitions by cluster_id...")
 
-    import spark.implicits._
-
-    // Get the column indices for cluster_id and distance
-    val clusterIdIdx = df.schema.fieldIndex("cluster_id")
-    val distanceIdx = df.schema.fieldIndex("distance")
-
-    // Convert to RDD for repartitioning and sorting
-    val repartitionedRDD = df.rdd
-      .map { row =>
-        val clusterId = row.getInt(clusterIdIdx)
-        (clusterId, row)
-      }
-      .partitionBy(new HashPartitioner(clusterCount))
-      .mapPartitions { partition =>
-        // Sort within each partition by distance (ascending - closest to center first)
-        partition.toSeq.sortBy { case (clusterId, row) =>
-          row.getFloat(distanceIdx)
-        }.map(_._2).iterator
-      }
-
-    // Convert back to DataFrame
-    val sortedDF = spark.createDataFrame(repartitionedRDD, df.schema)
+    // repartition by cluster_id ensures same cluster goes to same partition
+    // sortWithinPartitions uses external sort, avoiding OOM on large partitions
+    val sortedDF = df
+      .repartition(clusterCount, col("cluster_id"))
+      .sortWithinPartitions(col("cluster_id"), col("distance").asc)
 
     val repartitionTime = (System.currentTimeMillis() - startTime) / 1000.0
     logger.info(f"✓ Repartitioning and sorting completed in $repartitionTime%.2f seconds")
@@ -272,122 +375,442 @@ class VectorDedupApp(
     val finalPartitions = sortedDF.rdd.getNumPartitions
     logger.info(s"Final number of partitions: $finalPartitions")
 
+    // Log bucket (cluster) size distribution
+    val bucketStats = sortedDF
+      .groupBy("cluster_id")
+      .agg(count("*").as("count"))
+      .orderBy("cluster_id")
+      .collect()
+
+    logger.info("Bucket entries distribution:")
+    bucketStats.foreach { row =>
+      val clusterId = row.getAs[Int]("cluster_id")
+      val count = row.getAs[Long]("count")
+      logger.info(s"  Bucket $clusterId: $count entries")
+    }
+
     sortedDF
   }
 
   /**
-   * Step 3: Build Threshold Graph within each Executor
+   * Step 3: Build Threshold Graph, Find Connected Components, and Deduplicate (all in one pass)
    *
-   * For each cluster partition (on each executor):
-   * 1. Vectors are already sorted by distance to center
-   * 2. Compare each vector with subsequent vectors
-   * 3. If euclidean distance < threshold: add edge
-   * 4. Optimize: early stop when distance to center diff > threshold
+   * This method combines graph building, Union-Find, and deduplication into a single mapPartitions:
+   * 1. Vectors are already sorted by distance to center (by previous step)
+   * 2. Compare each vector with others WITHIN SAME BUCKET
+   * 3. If distance < threshold: union the two vectors in Union-Find
+   * 4. Compute min distance per component locally
+   * 5. Mark representatives (vectors with min distance in their component)
+   *
+   * Since buckets are independent (no cross-bucket edges), everything is done locally
+   * within each partition - NO SHUFFLE NEEDED!
    *
    * Input:  | id: Long | features: Array[Float] | cluster_id: Int | distance: Float |
+   *         (partitioned by cluster_id, sorted by distance within partition)
    *
-   * Output: | src_id: Long | dst_id: Long | edge_distance: Float |
-   *         (edges between similar vectors within same cluster)
+   * Output: | id: Long | features: Array[Float] | cluster_id: Int | distance: Float | component_id: Long | is_representative: Boolean |
+   *         (complete deduplicated result with all fields)
    */
-  private def buildThresholdGraph(df: DataFrame): DataFrame = {
-    logger.info("Step 3: Building threshold graph within each executor...")
+  private def buildGraphFindComponentsAndDeduplicate(df: DataFrame): DataFrame = {
+    logger.info("Step 3: Building threshold graph, finding components, and deduplicating (all in one pass)...")
     val startTime = System.currentTimeMillis()
 
     val spark = df.sparkSession
     val threshold = distanceThreshold
+    val metric = distanceMetric
+    val featCol = featuresCol
+    val idColumn = idCol
 
-    // Build graph edges within each partition (cluster)
-    // Each partition contains vectors from ONE cluster, sorted by distance to center
-    val edgesRDD = df.rdd.mapPartitions { partition =>
-      val vectors = partition.toArray
-      val edges = scala.collection.mutable.ArrayBuffer[(Long, Long, Float)]()
+    // Get the schema for output
+    val outputSchema = df.schema
+      .add("component_id", LongType, nullable = false)
+      .add("is_representative", BooleanType, nullable = false)
 
-      // Compare each vector with subsequent vectors in the same partition
-      for (i <- vectors.indices) {
-        val vi = vectors(i)
-        val id_i = vi.getAs[Long](idCol)
-        val features_i = vi.getAs[scala.collection.mutable.WrappedArray[Float]](featuresCol).toArray
-        val dist_i = vi.getAs[Float]("distance") // distance to cluster center
+    // Build graph, find components, and deduplicate within each partition
+    val resultRDD = df.rdd.mapPartitions { rowIterator =>
+      // Collect all vectors in this partition first (needed for Union-Find)
+      val vectors = rowIterator.toArray
 
-        // Compare with subsequent vectors
-        var j = i + 1
-        var continue = true
+      if (vectors.isEmpty) {
+        Iterator.empty
+      } else {
+        val bucketId = vectors(0).getAs[Int]("cluster_id")
+        val totalVectors = vectors.length
 
-        while (j < vectors.length && continue) {
-          val vj = vectors(j)
-          val id_j = vj.getAs[Long](idCol)
-          val features_j = vj.getAs[scala.collection.mutable.WrappedArray[Float]](featuresCol).toArray
-          val dist_j = vj.getAs[Float]("distance")
+        // Union-Find data structure using arrays for efficiency
+        val idToIndex = scala.collection.mutable.HashMap[Long, Int]()
+        val indexToId = new Array[Long](totalVectors)
+        val parent = new Array[Int](totalVectors)
+        val rank = new Array[Int](totalVectors)
 
-          // Triangle inequality optimization for early pruning:
-          // Upper bound: definitely duplicate (can add edge without computing distance)
-          // Lower bound: definitely not duplicate (can skip computation)
+        // Initialize Union-Find: each vector is its own component
+        var idx = 0
+        while (idx < totalVectors) {
+          val id = vectors(idx).getAs[Long](idColumn)
+          idToIndex(id) = idx
+          indexToId(idx) = id
+          parent(idx) = idx
+          rank(idx) = 0
+          idx += 1
+        }
 
-          val (definitelyDuplicate, definitelyNotDuplicate) = distanceMetric match {
-            case "l2" =>
-              // Upper bound: ||v_i - v_j|| <= d_i + d_j
-              // If d_i + d_j < threshold, then definitely duplicate
-              val upperBound = dist_i + dist_j < threshold
-
-              // Lower bound: ||v_i - v_j|| >= |d_i - d_j|
-              // If |d_i - d_j| > threshold, then definitely not duplicate
-              val lowerBound = math.abs(dist_j - dist_i) > threshold
-
-              (upperBound, lowerBound)
-
-            case "cosine" =>
-              // For cosine distance, we only have reliable lower bound
-              // Upper bound optimization is less straightforward for cosine
-              val upperBound = false  // Conservative: don't use upper bound for cosine
-
-              // Lower bound: dist(v_i, v_j) >= |d_i - d_j|
-              // If |d_i - d_j| > (1 - threshold), then similarity < threshold → not duplicate
-              val lowerBound = math.abs(dist_j - dist_i) > (1.0f - threshold)
-
-              (upperBound, lowerBound)
-
-            case _ => (false, false)
+        // Union-Find: find with path compression
+        def find(x: Int): Int = {
+          if (parent(x) != x) {
+            parent(x) = find(parent(x))
           }
+          parent(x)
+        }
 
-          if (definitelyDuplicate) {
-            // Triangle inequality guarantees they are duplicates
-            // Add edge without computing actual distance (use upper bound as estimate)
-            val estimatedDist = dist_i + dist_j
-            edges.append((id_i, id_j, estimatedDist))
-            edges.append((id_j, id_i, estimatedDist))
-          } else if (definitelyNotDuplicate) {
-            // Triangle inequality guarantees they are not duplicates
-            // Skip computation and stop checking further vectors (early stopping)
-            continue = false
-          } else {
-            // Need to compute actual distance
-            val dist = computeDistance(features_i, features_j)
-
-            if (dist < threshold) {
-              // Add bidirectional edge (for undirected graph)
-              edges.append((id_i, id_j, dist))
-              edges.append((id_j, id_i, dist))
+        // Union-Find: union by rank
+        def union(x: Int, y: Int): Unit = {
+          val rootX = find(x)
+          val rootY = find(y)
+          if (rootX != rootY) {
+            if (rank(rootX) < rank(rootY)) {
+              parent(rootX) = rootY
+            } else if (rank(rootX) > rank(rootY)) {
+              parent(rootY) = rootX
+            } else {
+              parent(rootY) = rootX
+              rank(rootX) += 1
             }
           }
+        }
 
-          j += 1
+        // Distance metric flags
+        val useCosine = metric == "cosine"
+        val thresholdSq = threshold * threshold
+
+        // Pre-extract all feature vectors and distances to center for efficient access
+        val featureVectors = new Array[Array[Float]](totalVectors)
+        val distToCenter = new Array[Float](totalVectors)
+        var k = 0
+        while (k < totalVectors) {
+          featureVectors(k) = vectors(k).getAs[scala.collection.mutable.WrappedArray[Float]](featCol).toArray
+          distToCenter(k) = vectors(k).getAs[Float]("distance")
+          k += 1
+        }
+
+        // Inline distance computation
+        def computeL2DistanceSq(v1: Array[Float], v2: Array[Float]): Float = {
+          var sumSq = 0.0f
+          var idx = 0
+          val len = v1.length
+          while (idx < len) {
+            val diff = v1(idx) - v2(idx)
+            sumSq += diff * diff
+            idx += 1
+          }
+          sumSq
+        }
+
+        def computeCosineDistance(v1: Array[Float], v2: Array[Float]): Float = {
+          var dotProduct = 0.0f
+          var norm1Sq = 0.0f
+          var norm2Sq = 0.0f
+          var idx = 0
+          val len = v1.length
+          while (idx < len) {
+            dotProduct += v1(idx) * v2(idx)
+            norm1Sq += v1(idx) * v1(idx)
+            norm2Sq += v2(idx) * v2(idx)
+            idx += 1
+          }
+          val norm1 = math.sqrt(norm1Sq).toFloat
+          val norm2 = math.sqrt(norm2Sq).toFloat
+          if (norm1 > 0 && norm2 > 0) {
+            1.0f - (dotProduct / (norm1 * norm2))
+          } else {
+            1.0f
+          }
+        }
+
+        var edgeCount = 0
+        var prunedByLowerBound = 0L
+        var prunedByUpperBound = 0L
+
+        // Full pairwise comparison with triangle inequality pruning
+        var i = 0
+        while (i < totalVectors) {
+          val features_i = featureVectors(i)
+          val dist_i = distToCenter(i)
+          var j = i + 1
+          while (j < totalVectors) {
+            val dist_j = distToCenter(j)
+            val distDiff = math.abs(dist_i - dist_j)
+
+            if (useCosine) {
+              // Cosine: lower bound pruning
+              if (distDiff > threshold) {
+                prunedByLowerBound += 1
+              } else {
+                val dist = computeCosineDistance(features_i, featureVectors(j))
+                if (dist < threshold) {
+                  union(i, j)
+                  edgeCount += 1
+                }
+              }
+            } else {
+              // L2: both upper and lower bound pruning
+              if (distDiff > threshold) {
+                prunedByLowerBound += 1
+              } else {
+                val distSum = dist_i + dist_j
+                if (distSum < threshold) {
+                  union(i, j)
+                  edgeCount += 1
+                  prunedByUpperBound += 1
+                } else {
+                  val distSq = computeL2DistanceSq(features_i, featureVectors(j))
+                  if (distSq < thresholdSq) {
+                    union(i, j)
+                    edgeCount += 1
+                  }
+                }
+              }
+            }
+            j += 1
+          }
+          i += 1
+        }
+
+        // Compute min distance per component (locally, no shuffle!)
+        val componentMinDist = scala.collection.mutable.HashMap[Long, Float]()
+        var m = 0
+        while (m < totalVectors) {
+          val rootIdx = find(m)
+          val componentId = indexToId(rootIdx)
+          val dist = distToCenter(m)
+          componentMinDist.get(componentId) match {
+            case Some(minDist) =>
+              if (dist < minDist) componentMinDist(componentId) = dist
+            case None =>
+              componentMinDist(componentId) = dist
+          }
+          m += 1
+        }
+
+        val totalPairs = totalVectors.toLong * (totalVectors - 1) / 2
+        val computed = totalPairs - prunedByLowerBound - prunedByUpperBound
+        val componentCount = componentMinDist.size
+        logger.info(f"  Bucket $bucketId: $totalVectors vectors, $edgeCount edges, $componentCount components, " +
+          f"pruned: ${prunedByLowerBound + prunedByUpperBound} (lower=$prunedByLowerBound, upper=$prunedByUpperBound), " +
+          f"computed: $computed/${totalPairs} (${computed * 100.0 / totalPairs}%.1f%%)")
+
+        // Output complete rows with component_id and is_representative
+        vectors.indices.iterator.map { idx =>
+          val row = vectors(idx)
+          val rootIdx = find(idx)
+          val componentId = indexToId(rootIdx)
+          val dist = distToCenter(idx)
+          val isRepresentative = dist == componentMinDist(componentId)
+
+          // Build output row: original fields + component_id + is_representative
+          org.apache.spark.sql.Row.fromSeq(row.toSeq :+ componentId :+ isRepresentative)
         }
       }
-
-      edges.iterator
     }
 
-    // Convert to DataFrame
+    val resultDF = spark.createDataFrame(resultRDD, outputSchema)
+
+    val totalTime = (System.currentTimeMillis() - startTime) / 1000.0
+    logger.info(f"✓ Graph + Union-Find + Dedup completed in $totalTime%.2f seconds")
+
+    resultDF
+  }
+
+  /**
+   * Old Step 3: Build Threshold Graph and Find Connected Components within each Bucket
+   * (Kept for backward compatibility, but not used in optimized pipeline)
+   */
+  private def buildThresholdGraphAndFindComponents(df: DataFrame): DataFrame = {
+    logger.info("Step 3: Building threshold graph and finding components (bucket-local Union-Find)...")
+    val startTime = System.currentTimeMillis()
+
+    val spark = df.sparkSession
+    val threshold = distanceThreshold
+    val metric = distanceMetric
+    val featCol = featuresCol
+    val idColumn = idCol
+
+    // Build graph and find components within each partition using Union-Find
+    val componentsRDD = df.rdd.mapPartitions { rowIterator =>
+      // Collect all vectors in this partition first (needed for Union-Find)
+      val vectors = rowIterator.toArray
+
+      if (vectors.isEmpty) {
+        Iterator.empty
+      } else {
+        val bucketId = vectors(0).getAs[Int]("cluster_id")
+        val totalVectors = vectors.length
+
+        // Union-Find data structure using arrays for efficiency
+        // Map vector id -> index for Union-Find operations
+        val idToIndex = scala.collection.mutable.HashMap[Long, Int]()
+        val indexToId = new Array[Long](totalVectors)
+        val parent = new Array[Int](totalVectors)
+        val rank = new Array[Int](totalVectors)
+
+        // Initialize Union-Find: each vector is its own component
+        var idx = 0
+        while (idx < totalVectors) {
+          val id = vectors(idx).getAs[Long](idColumn)
+          idToIndex(id) = idx
+          indexToId(idx) = id
+          parent(idx) = idx
+          rank(idx) = 0
+          idx += 1
+        }
+
+        // Union-Find: find with path compression
+        def find(x: Int): Int = {
+          if (parent(x) != x) {
+            parent(x) = find(parent(x))
+          }
+          parent(x)
+        }
+
+        // Union-Find: union by rank
+        def union(x: Int, y: Int): Unit = {
+          val rootX = find(x)
+          val rootY = find(y)
+          if (rootX != rootY) {
+            if (rank(rootX) < rank(rootY)) {
+              parent(rootX) = rootY
+            } else if (rank(rootX) > rank(rootY)) {
+              parent(rootY) = rootX
+            } else {
+              parent(rootY) = rootX
+              rank(rootX) += 1
+            }
+          }
+        }
+
+        // Distance metric flags
+        val useCosine = metric == "cosine"
+        val thresholdSq = threshold * threshold
+
+        // Pre-extract all feature vectors and distances to center for efficient access
+        val featureVectors = new Array[Array[Float]](totalVectors)
+        val distToCenter = new Array[Float](totalVectors)
+        var k = 0
+        while (k < totalVectors) {
+          featureVectors(k) = vectors(k).getAs[scala.collection.mutable.WrappedArray[Float]](featCol).toArray
+          distToCenter(k) = vectors(k).getAs[Float]("distance")
+          k += 1
+        }
+
+        // Inline distance computation
+        def computeL2DistanceSq(v1: Array[Float], v2: Array[Float]): Float = {
+          var sumSq = 0.0f
+          var idx = 0
+          val len = v1.length
+          while (idx < len) {
+            val diff = v1(idx) - v2(idx)
+            sumSq += diff * diff
+            idx += 1
+          }
+          sumSq
+        }
+
+        def computeCosineDistance(v1: Array[Float], v2: Array[Float]): Float = {
+          var dotProduct = 0.0f
+          var norm1Sq = 0.0f
+          var norm2Sq = 0.0f
+          var idx = 0
+          val len = v1.length
+          while (idx < len) {
+            dotProduct += v1(idx) * v2(idx)
+            norm1Sq += v1(idx) * v1(idx)
+            norm2Sq += v2(idx) * v2(idx)
+            idx += 1
+          }
+          val norm1 = math.sqrt(norm1Sq).toFloat
+          val norm2 = math.sqrt(norm2Sq).toFloat
+          if (norm1 > 0 && norm2 > 0) {
+            1.0f - (dotProduct / (norm1 * norm2))
+          } else {
+            1.0f
+          }
+        }
+
+        var edgeCount = 0
+        var prunedByLowerBound = 0L
+        var prunedByUpperBound = 0L
+
+        // Full pairwise comparison with triangle inequality pruning
+        var i = 0
+        while (i < totalVectors) {
+          val features_i = featureVectors(i)
+          val dist_i = distToCenter(i)
+          var j = i + 1
+          while (j < totalVectors) {
+            val dist_j = distToCenter(j)
+            val distDiff = math.abs(dist_i - dist_j)
+
+            if (useCosine) {
+              // Cosine: lower bound pruning
+              // If |d_i - d_j| > threshold, then dist(v_i, v_j) > threshold → not duplicate
+              if (distDiff > threshold) {
+                prunedByLowerBound += 1
+              } else {
+                val dist = computeCosineDistance(features_i, featureVectors(j))
+                if (dist < threshold) {
+                  union(i, j)
+                  edgeCount += 1
+                }
+              }
+            } else {
+              // L2: both upper and lower bound pruning
+              // Lower bound: |d_i - d_j| > threshold → not duplicate
+              if (distDiff > threshold) {
+                prunedByLowerBound += 1
+              } else {
+                val distSum = dist_i + dist_j
+                // Upper bound: d_i + d_j < threshold → must be duplicate
+                if (distSum < threshold) {
+                  union(i, j)
+                  edgeCount += 1
+                  prunedByUpperBound += 1
+                } else {
+                  // Need actual distance computation
+                  val distSq = computeL2DistanceSq(features_i, featureVectors(j))
+                  if (distSq < thresholdSq) {
+                    union(i, j)
+                    edgeCount += 1
+                  }
+                }
+              }
+            }
+            j += 1
+          }
+          i += 1
+        }
+
+        val totalPairs = totalVectors.toLong * (totalVectors - 1) / 2
+        val computed = totalPairs - prunedByLowerBound - prunedByUpperBound
+        logger.info(f"  Bucket $bucketId: $totalVectors vectors, $edgeCount edges, " +
+          f"pruned: ${prunedByLowerBound + prunedByUpperBound} (lower=$prunedByLowerBound, upper=$prunedByUpperBound), " +
+          f"computed: $computed/${totalPairs} (${computed * 100.0 / totalPairs}%.1f%%)")
+
+        // Output: (id, component_id) where component_id is the id of the root
+        vectors.indices.iterator.map { idx =>
+          val id = indexToId(idx)
+          val rootIdx = find(idx)
+          val componentId = indexToId(rootIdx)
+          (id, componentId)
+        }
+      }
+    }
+
     import spark.implicits._
-    val edgesDF = edgesRDD.toDF("src_id", "dst_id", "edge_distance")
+    val componentsDF = componentsRDD.toDF("id", "component_id")
 
-    val graphTime = (System.currentTimeMillis() - startTime) / 1000.0
-    val edgeCount = edgesDF.count()
+    val totalTime = (System.currentTimeMillis() - startTime) / 1000.0
+    logger.info(f"✓ Threshold graph + Union-Find completed in $totalTime%.2f seconds")
 
-    logger.info(f"✓ Threshold graph built in $graphTime%.2f seconds")
-    logger.info(s"Total edges: $edgeCount")
-
-    edgesDF
+    componentsDF
   }
 
   /**
@@ -585,21 +1008,28 @@ class VectorDedupApp(
 
     outputDir.foreach { dir =>
       // Save duplicates (is_representative = false)
+      // NOTE: For S3 data > disk capacity:
+      //   - Only save essential columns to minimize output size
+      //   - Use coalesce() to reduce number of output files
       val duplicatesPath = s"$dir/duplicates"
       logger.info(s"Saving duplicates to: $duplicatesPath")
       deduplicatedDF
         .filter(!$"is_representative")
         .select(idCol, "component_id")
+        .coalesce(100)  // Limit output files (adjust based on cluster size)
         .write
         .mode("overwrite")
         .parquet(duplicatesPath)
       logger.info(s"✓ Duplicates saved")
 
       // Save deduplicated vectors (is_representative = true)
+      // Select only essential columns to reduce output size by ~90%
       val dedupedPath = s"$dir/deduplicated"
       logger.info(s"Saving deduplicated vectors to: $dedupedPath")
       deduplicatedDF
         .filter($"is_representative")
+        .select(idCol, "features", "cluster_id", "component_id")
+        .coalesce(100)  // Limit output files
         .write
         .mode("overwrite")
         .parquet(dedupedPath)

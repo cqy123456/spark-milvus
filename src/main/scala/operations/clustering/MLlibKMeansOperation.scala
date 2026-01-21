@@ -73,8 +73,10 @@ class MLlibKMeansOperation(
       Vectors.dense(arr.map(_.toDouble).toArray)
     })
 
-    val vectorDF = df.withColumn("__mllib_features", toVector(col(featuresCol)))
-    vectorDF.cache()
+    val vectorDF = df.select(col(featuresCol))
+      .withColumn("__mllib_features", toVector(col(featuresCol)))
+      .drop(featuresCol)  // 删掉原始 Float 列
+      .cache()
     val conversionTime = System.currentTimeMillis() - conversionStart
     logger.info(s"Conversion completed in $conversionTime ms")
 

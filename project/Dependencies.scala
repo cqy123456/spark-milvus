@@ -2,15 +2,12 @@ import sbt._
 
 object Dependencies {
   // Version constants
-  lazy val scalapbVersion = "0.11.3"
-  // Spark 4.0.0 requires Java 17+ and may not be compatible with older clusters
-  // lazy val sparkVersion = "4.0.0"
-  lazy val sparkVersion = "3.5.4"  // Use Spark 3.5.4 for better cluster compatibility
+  lazy val scalapbVersion = "1.0.0-alpha.1"  // Use 1.0.x for Scala 2.13 compatibility
+  // Spark 4.0.1 requires Java 17+ and Scala 2.13
+  lazy val sparkVersion = "4.0.0"  // Use Spark 4.0.0 for K8s cluster (4.0.1 not yet released to Maven)
   lazy val grpcJavaVersion = "1.37.0"
-  // lazy val sparkVersion = "3.3.2"
-  lazy val parquetVersion = "1.13.1"
-  lazy val hadoopVersion =
-    "3.4.1" // can't be changed https://github.com/apache/spark/blob/v3.5.3/pom.xml
+  lazy val parquetVersion = "1.14.1"  // Updated for Spark 4.0
+  lazy val hadoopVersion = "3.4.1"  // Spark 4.0 uses Hadoop 3.4.x
   lazy val jacksonVersion = "2.17.3"
 
   lazy val munit = "org.scalameta" %% "munit" % "0.7.29"
@@ -71,7 +68,8 @@ object Dependencies {
   lazy val hdf5 = "cisd" % "jhdf5" % "19.04.1"
 
   // GraphFrames for graph processing
-  lazy val graphframes = "graphframes" % "graphframes" % "0.8.3-spark3.5-s_2.12"
+  // Note: GraphFrames not yet available for Spark 4.0, disabled for now
+  // lazy val graphframes = "graphframes" % "graphframes" % "0.8.4-spark3.5-s_2.12"
 
   // ND4J for optimized linear algebra and vector operations
   // nd4j-native-platform: CPU backend with AVX/AVX2/AVX-512 optimizations

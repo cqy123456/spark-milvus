@@ -3,7 +3,7 @@ package com.zilliz.spark.connector.operations.graph
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-import org.graphframes.GraphFrame
+// GraphFrames not available for Spark 4.0, use local implementation only
 import org.slf4j.{Logger, LoggerFactory}
 
 /**
@@ -29,14 +29,12 @@ class ConnectedComponentsOperation(
   require(checkpointInterval >= 0, "Checkpoint interval must be non-negative")
 
   /**
-   * Main entry point - chooses algorithm based on local parameter
+   * Main entry point - uses block-level Union-Find algorithm
+   * Note: GraphFrames LargeStar algorithm is not available for Spark 4.0
    */
   def findComponents(edgesDF: DataFrame): DataFrame = {
-    if (local) {
-      findComponentsBlockUnionFind(edgesDF)
-    } else {
-      findComponentsLargeStar(edgesDF)
-    }
+    // Always use local implementation since graphframes is not available
+    findComponentsBlockUnionFind(edgesDF)
   }
 
   /**
@@ -145,75 +143,8 @@ class ConnectedComponentsOperation(
     components
   }
 
-  /**
-   * LargeStar Algorithm using GraphFrames
-   *
-   * Good for: Sparse graphs, distributed computation, large datasets
-   * Uses GraphFrames library which implements "Connected Components in MapReduce and Beyond"
-   */
-  def findComponentsLargeStar(edgesDF: DataFrame): DataFrame = {
-    logger.info("=" * 80)
-    logger.info("Connected Components (LargeStar - GraphFrames)")
-    logger.info("=" * 80)
-
-    val startTime = System.currentTimeMillis()
-    val spark = edgesDF.sparkSession
-    import spark.implicits._
-
-    // Prepare edges: rename columns to match GraphFrame requirements
-    val edges = edgesDF
-      .select($"src_id".as("src"), $"dst_id".as("dst"))
-      .cache()
-
-    val edgeCount = edges.count()
-    logger.info(s"Processing $edgeCount edges...")
-
-    // Extract vertices from edges
-    val vertices = edges.select($"src".as("id"))
-      .union(edges.select($"dst".as("id")))
-      .distinct()
-      .cache()
-
-    val vertexCount = vertices.count()
-    logger.info(s"Total vertices: $vertexCount")
-
-    // Create GraphFrame
-    val graph = GraphFrame(vertices, edges)
-
-    // Use GraphFrames algorithm (distributed LargeStar)
-    logger.info("Using GraphFrames algorithm (distributed LargeStar)...")
-
-    // Set checkpoint directory if not already set
-    val checkpointDir = spark.sparkContext.getCheckpointDir
-    if (checkpointDir.isEmpty) {
-      val tmpDir = System.getProperty("java.io.tmpdir")
-      val dir = s"$tmpDir/spark-checkpoints-${System.currentTimeMillis()}"
-      logger.info(s"Setting checkpoint directory: $dir")
-      spark.sparkContext.setCheckpointDir(dir)
-    }
-
-    val result = graph.connectedComponents
-      .setAlgorithm("graphframes")
-      .setCheckpointInterval(checkpointInterval)
-      .run()
-
-    // Rename component column to match expected output
-    val components = result
-      .select($"id", $"component".as("component_id"))
-      .cache()
-
-    val totalTime = (System.currentTimeMillis() - startTime) / 1000.0
-    logger.info(f"✓ Connected components computed in $totalTime%.2f seconds")
-
-    // Cleanup
-    edges.unpersist()
-    vertices.unpersist()
-
-    // Log statistics
-    logComponentStatistics(components)
-
-    components
-  }
+  // Note: GraphFrames LargeStar algorithm removed - not available for Spark 4.0
+  // Use findComponentsBlockUnionFind instead
 
   /**
    * Log component statistics
