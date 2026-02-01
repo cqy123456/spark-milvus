@@ -47,7 +47,8 @@ object VectorDedupBenchmark {
     miniBatchSampleRatio: Double = 0.1,    // Sample ratio for mini-batch (0.0, 1.0]
     normalize: Boolean = false,            // Whether to L2 normalize input vectors
     featuresCol: String = "features",
-    idCol: String = "id"
+    idCol: String = "id",
+    useNd4j: Boolean = false               // 是否使用 ND4J 加速，false 使用纯 Scala 实现避免 native 内存 OOM
   )
 
   /**
@@ -140,52 +141,8 @@ object VectorDedupBenchmark {
     totalEdges: Long = 0L
   ) {
     def print(): Unit = {
-      logger.info("=" * 80)
-      logger.info("BENCHMARK RESULTS")
-      logger.info("=" * 80)
-      logger.info(s"Dataset: $datasetName")
-      logger.info(s"Configuration: $configName")
-      logger.info(s"Total vectors: $totalVectors")
-      logger.info(s"Representatives: $representatives")
-      logger.info(s"Duplicates removed: $duplicatesRemoved")
-      logger.info(f"Deduplication rate: $deduplicationRate%.2f%%")
-      logger.info(f"Total time: $totalTimeSeconds%.2f seconds")
-
-      println("\n" + "=" * 80)
-      println("VECTOR DEDUPLICATION BENCHMARK RESULTS")
-      println("=" * 80)
-
-      println(s"\nDataset: $datasetName")
-      println(s"Configuration: $configName")
-      println(s"Total vectors: $totalVectors")
-      println(s"Representatives: $representatives")
-      println(s"Duplicates removed: $duplicatesRemoved")
-      println(f"Deduplication rate: $deduplicationRate%.2f%%")
-      if (totalEdges > 0) {
-        println(s"Total graph edges: $totalEdges")
-      }
-
-      if (operatorTimings.nonEmpty) {
-        println("\n" + "-" * 80)
-        println("OPERATOR TIMING BREAKDOWN")
-        println("-" * 80)
-        println(f"${"Operator"}%-45s ${"Duration (s)"}%15s ${"Percentage"}%12s")
-        println("-" * 80)
-
-        operatorTimings.foreach { timing =>
-          val percentage = if (totalTimeSeconds > 0) (timing.durationSeconds / totalTimeSeconds) * 100 else 0.0
-          println(f"${timing.name}%-45s ${timing.durationSeconds}%15.2f ${percentage}%11.1f%%")
-          logger.info(f"${timing.name}: ${timing.durationSeconds}%.2f seconds (${percentage}%.1f%%)")
-        }
-
-        println("-" * 80)
-        println(f"${"TOTAL"}%-45s ${totalTimeSeconds}%15.2f ${"100.0"}%11s%%")
-      } else {
-        println(f"\nTotal time: $totalTimeSeconds%.2f seconds")
-      }
-
-      println("=" * 80)
-      logger.info("=" * 80)
+      // 简化输出
+      logger.info(f"RESULT: $datasetName, $configName, total=$totalVectors, dedup_rate=$deduplicationRate%.2f%%, time=$totalTimeSeconds%.2f s")
     }
   }
 
@@ -220,7 +177,7 @@ object VectorDedupBenchmark {
 
     // Add ID column if not exists
     val dfWithId = if (!inputDF.columns.contains("id")) {
-      import spark.implicits._
+      // Removed spark.implicits._ for Spark 4.0 compatibility - use col() instead of $
       inputDF.withColumn("id", monotonically_increasing_id())
     } else {
       inputDF
@@ -241,6 +198,7 @@ object VectorDedupBenchmark {
       miniBatchSampleRatio = dedupConfig.miniBatchSampleRatio,
       featuresCol = dedupConfig.featuresCol,
       idCol = dedupConfig.idCol
+      // Note: useNd4j parameter removed - VectorDedupApp now uses netlib-java (BLAS) by default
     )
 
     val startTime = System.currentTimeMillis()
@@ -248,8 +206,8 @@ object VectorDedupBenchmark {
     val totalTime = (System.currentTimeMillis() - startTime) / 1000.0
 
     // Calculate statistics
-    import spark.implicits._
-    val representatives = resultDF.filter($"is_representative").count()
+    // Removed spark.implicits._ for Spark 4.0 compatibility - use col() instead of $
+    val representatives = resultDF.filter(col("is_representative")).count()
     val duplicatesRemoved = totalVectors - representatives
     val deduplicationRate = (duplicatesRemoved.toDouble / totalVectors * 100)
 
@@ -261,18 +219,13 @@ object VectorDedupBenchmark {
       duplicatesRemoved = duplicatesRemoved,
       deduplicationRate = deduplicationRate,
       totalTimeSeconds = totalTime,
-      clusteringTimeSeconds = 0.0,  // Could be extracted from app metrics
+      clusteringTimeSeconds = 0.0,
       graphBuildingTimeSeconds = 0.0,
       componentFindingTimeSeconds = 0.0
     )
 
-    result.print()
-
-    // Show sample results
-    println("\nSample results (first 20 rows):")
-    resultDF.select("id", "cluster_id", "distance", "is_representative", "component_id")
-      .orderBy("cluster_id", "distance")
-      .show(20, truncate = false)
+    // 简化输出
+    println(f"\n[runBenchmark] Total: $totalVectors, Dedup rate: $deduplicationRate%.2f%%, Time: $totalTime%.2f s")
 
     result
   }
@@ -300,6 +253,9 @@ object VectorDedupBenchmark {
     val customAlgorithm = sys.env.get("BENCHMARK_ALGORITHM")
     val customSampleRatio = sys.env.get("BENCHMARK_SAMPLE_RATIO").map(_.toDouble)
     val customNormalize = sys.env.get("BENCHMARK_NORMALIZE").map(_.toBoolean)
+    val customDatasetPath = sys.env.get("BENCHMARK_DATASET_PATH")
+    val customFeaturesCol = sys.env.get("BENCHMARK_FEATURES_COL")
+    val customUseNd4j = sys.env.get("BENCHMARK_USE_ND4J").map(_.toBoolean)
 
     // Create Spark session
     val spark = SparkSession.builder()
@@ -339,13 +295,22 @@ object VectorDedupBenchmark {
 
     try {
       // Select dataset
-      val datasetConfig = datasetName.toLowerCase match {
+      val baseDatasetConfig = datasetName.toLowerCase match {
         case "sift1m-train" => Datasets.SIFT1M_TRAIN
         case "sift1m-test" => Datasets.SIFT1M_TEST
         case "laion1m" => Datasets.LAION1M
         case _ =>
           logger.warn(s"Unknown dataset: $datasetName, using SIFT1M-Train")
           Datasets.SIFT1M_TRAIN
+      }
+
+      // Override path if BENCHMARK_DATASET_PATH is set
+      val datasetConfig = customDatasetPath match {
+        case Some(path) =>
+          logger.info(s"Using custom dataset path: $path")
+          baseDatasetConfig.copy(path = path)
+        case None =>
+          baseDatasetConfig
       }
 
       // Select or create deduplication config
@@ -366,12 +331,15 @@ object VectorDedupBenchmark {
         distanceMetric = customMetric.getOrElse(baseDedupConfig.distanceMetric),
         kmeansAlgorithm = customAlgorithm.getOrElse(baseDedupConfig.kmeansAlgorithm),
         miniBatchSampleRatio = customSampleRatio.getOrElse(baseDedupConfig.miniBatchSampleRatio),
-        normalize = customNormalize.getOrElse(baseDedupConfig.normalize)
+        normalize = customNormalize.getOrElse(baseDedupConfig.normalize),
+        featuresCol = customFeaturesCol.getOrElse(baseDedupConfig.featuresCol),
+        useNd4j = customUseNd4j.getOrElse(baseDedupConfig.useNd4j)
       )
 
       val finalConfigName = {
         val hasCustom = customK.isDefined || customThreshold.isDefined ||
-          customMetric.isDefined || customAlgorithm.isDefined || customNormalize.isDefined
+          customMetric.isDefined || customAlgorithm.isDefined || customNormalize.isDefined ||
+          customUseNd4j.isDefined
         if (hasCustom) s"$configName-custom" else configName
       }
 
@@ -396,7 +364,7 @@ object VectorDedupBenchmark {
     dedupConfig: DedupConfig,
     configName: String = "Custom"
   ): BenchmarkResult = {
-    import spark.implicits._
+    // Removed spark.implicits._ for Spark 4.0 compatibility - use col() instead of $
 
     val timings = scala.collection.mutable.ArrayBuffer[OperatorTiming]()
     val overallStart = System.currentTimeMillis()
@@ -415,6 +383,7 @@ object VectorDedupBenchmark {
       logger.info(s"  MiniBatch sample ratio: ${dedupConfig.miniBatchSampleRatio}")
     }
     logger.info(s"  Normalize input: ${dedupConfig.normalize}")
+    logger.info(s"  Use ND4J: ${dedupConfig.useNd4j}")
     logger.info("=" * 80)
 
     println("\n" + "=" * 80)
@@ -432,6 +401,7 @@ object VectorDedupBenchmark {
       println(s"  MiniBatch sample ratio: ${dedupConfig.miniBatchSampleRatio}")
     }
     println(s"  Normalize input: ${dedupConfig.normalize}")
+    println(s"  Use ND4J: ${dedupConfig.useNd4j}")
     println("=" * 80)
 
     // Step 0: Load data
@@ -450,16 +420,22 @@ object VectorDedupBenchmark {
       inputDF
     }
 
+    // Coalesce to reduce partitions without shuffle (narrow dependency)
+    val numPartitions = spark.conf.get("spark.sql.shuffle.partitions", "200").toInt
+    logger.info(s"Coalescing data to $numPartitions partitions...")
+    println(s"Coalescing data to $numPartitions partitions...")
+    val dfRepartitioned = dfWithIdRaw.coalesce(numPartitions)
+
     // Apply L2 normalization if configured
     val dfWithId = if (dedupConfig.normalize) {
       logger.info("Applying L2 normalization to input vectors...")
       println("Applying L2 normalization to input vectors...")
-      normalizeVectors(dfWithIdRaw, dedupConfig.featuresCol)
+      normalizeVectors(dfRepartitioned, dedupConfig.featuresCol)
     } else {
-      dfWithIdRaw
+      dfRepartitioned
     }
 
-    dfWithId.cache()
+    // NOTE: No caching in benchmark - let the actual operations decide caching strategy
     val totalVectors = dfWithId.count()
     val loadTime = (System.currentTimeMillis() - loadStart) / 1000.0
     val loadDesc = if (dedupConfig.normalize) s"Load and normalize $totalVectors vectors" else s"Load $totalVectors vectors"
@@ -479,11 +455,12 @@ object VectorDedupBenchmark {
       miniBatchSampleRatio = dedupConfig.miniBatchSampleRatio,
       featuresCol = dedupConfig.featuresCol,
       idCol = dedupConfig.idCol
+      // Note: useNd4j parameter removed - VectorDedupApp now uses netlib-java (BLAS) by default
     )
 
     // Run deduplication with detailed timing
     val dedupStart = System.currentTimeMillis()
-    val (resultDF, dedupTimingStats) = app.deduplicateWithTiming(dfWithId)
+    val (resultDF: DataFrame, dedupTimingStats: DedupTimingStats) = app.deduplicateWithTiming(dfWithId)
     val dedupTime = (System.currentTimeMillis() - dedupStart) / 1000.0
 
     // Add individual step timings from VectorDedupApp
@@ -496,7 +473,7 @@ object VectorDedupBenchmark {
     }
 
     // Calculate statistics
-    val representatives = resultDF.filter($"is_representative").count()
+    val representatives = resultDF.filter(col("is_representative")).count()
     val duplicatesRemoved = totalVectors - representatives
     val deduplicationRate = (duplicatesRemoved.toDouble / totalVectors * 100)
 
@@ -516,16 +493,26 @@ object VectorDedupBenchmark {
       operatorTimings = timings.toSeq
     )
 
-    result.print()
-
-    // Show sample results
-    println("\nSample results (first 20 rows):")
-    resultDF.select("id", "cluster_id", "distance", "is_representative", "component_id")
-      .orderBy("cluster_id", "distance")
-      .show(20, truncate = false)
-
-    // Cleanup
-    dfWithId.unpersist()
+    // 输出关键指标和时间分解
+    println("\n" + "=" * 80)
+    println("BENCHMARK RESULTS")
+    println("=" * 80)
+    println(f"Total vectors:      $totalVectors")
+    println(f"Representatives:    $representatives")
+    println(f"Duplicates removed: $duplicatesRemoved")
+    println(f"Deduplication rate: $deduplicationRate%.2f%%")
+    println("-" * 80)
+    println("OPERATOR TIMING BREAKDOWN")
+    println("-" * 80)
+    println(f"${"Operator"}%-45s ${"Duration (s)"}%15s ${"Percentage"}%12s")
+    println("-" * 80)
+    timings.foreach { timing =>
+      val percentage = if (totalTime > 0) (timing.durationSeconds / totalTime) * 100 else 0.0
+      println(f"${timing.name}%-45s ${timing.durationSeconds}%15.2f ${percentage}%11.1f%%")
+    }
+    println("-" * 80)
+    println(f"${"TOTAL"}%-45s ${totalTime}%15.2f ${"100.0"}%11s%%")
+    println("=" * 80)
 
     result
   }
@@ -534,8 +521,6 @@ object VectorDedupBenchmark {
    * L2 normalize vectors in the DataFrame
    */
   private def normalizeVectors(df: DataFrame, featuresCol: String): DataFrame = {
-    import df.sparkSession.implicits._
-
     val normalizeUDF = udf { (features: Seq[Float]) =>
       if (features == null || features.isEmpty) {
         features

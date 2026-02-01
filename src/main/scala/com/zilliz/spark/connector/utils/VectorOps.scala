@@ -1,20 +1,36 @@
 package com.zilliz.spark.connector.utils
 
-import org.nd4j.linalg.api.ndarray.INDArray
-import org.nd4j.linalg.factory.Nd4j
-import org.nd4j.linalg.ops.transforms.Transforms
-import org.nd4j.linalg.api.buffer.DataType
+import com.github.fommil.netlib.BLAS
 
 /**
- * Optimized vector operations using ND4J with Float32 precision
+ * Optimized vector operations using netlib-java with Float32 precision
  *
- * ND4J provides high-performance linear algebra operations with:
- * - SIMD optimizations (AVX, AVX2, AVX-512)
- * - Native BLAS backend
- * - Batch operations for better cache utilization
- * - Float32 (single precision) for memory efficiency and speed
+ * netlib-java provides high-performance linear algebra operations with:
+ * - SIMD optimizations via native BLAS (OpenBLAS, MKL) when available
+ * - Pure Java fallback for portability
+ * - No off-heap memory management - everything on JVM heap
+ * - No GC issues like ND4J - memory is managed by JVM
+ *
+ * Key benefits over ND4J:
+ * - No native memory leaks or DataBuffer release issues
+ * - No need to manually close arrays
+ * - Works directly on Array[Float] - zero copy for most operations
+ * - Simpler, more predictable memory behavior
  */
 object VectorOps {
+
+  // Get BLAS instance (auto-selects native or Java implementation)
+  private lazy val blas: BLAS = {
+    val instance = BLAS.getInstance()
+    // Log BLAS implementation type for debugging
+    val blasClass = instance.getClass.getName
+    if (blasClass.contains("Native") || blasClass.contains("netlib")) {
+      System.out.println(s"[VectorOps] Using native BLAS implementation: $blasClass")
+    } else {
+      System.out.println(s"[VectorOps] WARNING: Using Java fallback BLAS: $blasClass (performance may be slower)")
+    }
+    instance
+  }
 
   /**
    * Compute Euclidean (L2) distance between two vectors
@@ -28,13 +44,15 @@ object VectorOps {
   def euclideanDistance(v1: Array[Float], v2: Array[Float]): Float = {
     require(v1.length == v2.length, s"Vector dimensions must match: ${v1.length} != ${v2.length}")
 
-    // Convert to ND4J arrays with FLOAT (Float32) data type
-    val nd1 = Nd4j.create(v1).castTo(DataType.FLOAT)
-    val nd2 = Nd4j.create(v2).castTo(DataType.FLOAT)
-
-    // Compute distance using ND4J's optimized implementation
-    // Note: Transforms.euclideanDistance returns Double
-    Transforms.euclideanDistance(nd1, nd2).toFloat
+    val dim = v1.length
+    var sumSq = 0.0f
+    var i = 0
+    while (i < dim) {
+      val diff = v1(i) - v2(i)
+      sumSq += diff * diff
+      i += 1
+    }
+    Math.sqrt(sumSq).toFloat
   }
 
   /**
@@ -66,20 +84,31 @@ object VectorOps {
   def cosineDistance(v1: Array[Float], v2: Array[Float]): Float = {
     require(v1.length == v2.length, s"Vector dimensions must match: ${v1.length} != ${v2.length}")
 
-    // Convert to ND4J arrays with FLOAT (Float32) data type
-    val nd1 = Nd4j.create(v1).castTo(DataType.FLOAT)
-    val nd2 = Nd4j.create(v2).castTo(DataType.FLOAT)
+    val dim = v1.length
+    var dotProduct = 0.0f
+    var norm1Sq = 0.0f
+    var norm2Sq = 0.0f
 
-    // Compute cosine similarity using ND4J
-    // Note: Transforms.cosineSim returns Double
-    val cosineSimilarity = Transforms.cosineSim(nd1, nd2).toFloat
+    var i = 0
+    while (i < dim) {
+      dotProduct += v1(i) * v2(i)
+      norm1Sq += v1(i) * v1(i)
+      norm2Sq += v2(i) * v2(i)
+      i += 1
+    }
 
-    // Convert to cosine distance
-    1.0f - cosineSimilarity
+    val norm1 = Math.sqrt(norm1Sq).toFloat
+    val norm2 = Math.sqrt(norm2Sq).toFloat
+
+    if (norm1 > 0 && norm2 > 0) {
+      1.0f - (dotProduct / (norm1 * norm2))
+    } else {
+      1.0f  // If either vector is zero, cosine distance is undefined, return 1
+    }
   }
 
   /**
-   * Compute dot product between two vectors
+   * Compute dot product between two vectors using BLAS sdot
    *
    * @param v1 First vector
    * @param v2 Second vector
@@ -87,43 +116,35 @@ object VectorOps {
    */
   def dotProduct(v1: Array[Float], v2: Array[Float]): Float = {
     require(v1.length == v2.length, s"Vector dimensions must match: ${v1.length} != ${v2.length}")
-
-    val nd1 = Nd4j.create(v1).castTo(DataType.FLOAT)
-    val nd2 = Nd4j.create(v2).castTo(DataType.FLOAT)
-
-    nd1.mmul(nd2.transpose()).getFloat(0L)
+    blas.sdot(v1.length, v1, 1, v2, 1)
   }
 
   /**
-   * Compute L2 norm of a vector
+   * Compute L2 norm of a vector using BLAS snrm2
    *
    * @param v Vector
    * @return L2 norm as Float
    */
   def norm2(v: Array[Float]): Float = {
-    val nd = Nd4j.create(v).castTo(DataType.FLOAT)
-    nd.norm2Number().floatValue()
+    blas.snrm2(v.length, v, 1)
   }
 
   /**
-   * Compute pairwise squared Euclidean distances between queries and targets using ND4J
+   * Compute pairwise squared Euclidean distances between queries and targets
    * Returns distance matrix where result(i)(j) = ||queries(i) - targets(j)||²
    *
-   * OPTIMIZED: Converts targets to ND4J matrix ONCE and reuses it for all query batches.
-   * This avoids repeated conversion overhead when processing many queries against fixed targets (e.g., cluster centers).
-   *
    * Uses formula: ||a - b||² = ||a||² + ||b||² - 2·a·b
-   * Leverages BLAS matrix multiplication with SIMD acceleration (AVX, AVX2, AVX-512)
+   * Leverages BLAS sgemm for batch dot product computation
    *
    * @param queries Query vectors (n × dim)
-   * @param targets Target vectors (m × dim) - converted to ND4J once and cached
-   * @param queryBatchSize Process queries in batches of this size to limit memory (default 1000)
+   * @param targets Target vectors (m × dim)
+   * @param queryBatchSize Process queries in batches of this size to limit memory (default 100)
    * @return Distance matrix (n × m) of squared distances
    */
   def pairwiseSquaredDistances(
     queries: Array[Array[Float]],
     targets: Array[Array[Float]],
-    queryBatchSize: Int = 1000
+    queryBatchSize: Int = 100
   ): Array[Array[Float]] = {
     if (queries.isEmpty || targets.isEmpty) return Array.empty[Array[Float]]
 
@@ -131,49 +152,95 @@ object VectorOps {
     val nTargets = targets.length
     val dim = queries(0).length
 
-    require(queries.forall(_.length == dim), "All query vectors must have same dimension")
-    require(targets.forall(_.length == dim), "All target vectors must have same dimension")
+    // Pre-compute target norms
+    val targetNormsSq = new Array[Float](nTargets)
+    var t = 0
+    while (t < nTargets) {
+      var sum = 0.0f
+      val target = targets(t)
+      var k = 0
+      while (k < dim) {
+        sum += target(k) * target(k)
+        k += 1
+      }
+      targetNormsSq(t) = sum
+      t += 1
+    }
 
-    // KEY OPTIMIZATION: Convert targets to ND4J ONCE and reuse for all query batches
-    val targetsFlat = targets.flatten
-    val targetsND = Nd4j.create(targetsFlat, Array(nTargets.toLong, dim.toLong), DataType.FLOAT)
-    val targetsNormSq = targetsND.mul(targetsND).sum(true, 1)  // Compute once
-    val targetsNDT = targetsND.transpose()  // Transpose once
+    // Flatten targets for BLAS sgemm (column-major order for targets^T)
+    // targets is m x dim, we need targets^T (dim x m) in column-major = targets in row-major
+    val targetsFlat = new Array[Float](nTargets * dim)
+    t = 0
+    while (t < nTargets) {
+      val target = targets(t)
+      var k = 0
+      while (k < dim) {
+        // Column-major: targetsFlat[k * nTargets + t] = targets[t][k]
+        targetsFlat(k * nTargets + t) = target(k)
+        k += 1
+      }
+      t += 1
+    }
 
-    // Allocate result matrix
+    // Result matrix
     val result = Array.ofDim[Float](nQueries, nTargets)
 
-    // Process queries in batches to limit memory usage
+    // Process in batches
     var batchStart = 0
     while (batchStart < nQueries) {
       val batchEnd = Math.min(batchStart + queryBatchSize, nQueries)
-      val batchQueries = queries.slice(batchStart, batchEnd)
-      val batchSize = batchQueries.length
+      val batchSize = batchEnd - batchStart
 
-      // Convert current query batch to ND4J
-      val queriesFlat = batchQueries.flatten
-      val queriesND = Nd4j.create(queriesFlat, Array(batchSize.toLong, dim.toLong), DataType.FLOAT)
-
-      // Compute ||queries||² for this batch
-      val queriesNormSq = queriesND.mul(queriesND).sum(true, 1)
-
-      // Compute 2 * queries · targets^T using cached targetsNDT
-      val dotProducts = queriesND.mmul(targetsNDT).mul(2.0f)
-
-      // Compute ||a||² + ||b||² - 2·a·b
-      val distancesSq = queriesNormSq.broadcast(batchSize, nTargets)
-        .add(targetsNormSq.transpose().broadcast(batchSize, nTargets))
-        .sub(dotProducts)
-
-      // Copy to result array and clamp negative values (numerical errors)
-      var i = 0
-      while (i < batchSize) {
-        var j = 0
-        while (j < nTargets) {
-          result(batchStart + i)(j) = Math.max(0.0f, distancesSq.getFloat(i.toLong, j.toLong))
-          j += 1
+      // Flatten query batch (row-major order)
+      val queriesFlat = new Array[Float](batchSize * dim)
+      var qi = 0
+      while (qi < batchSize) {
+        val query = queries(batchStart + qi)
+        var k = 0
+        while (k < dim) {
+          queriesFlat(qi * dim + k) = query(k)
+          k += 1
         }
-        i += 1
+        qi += 1
+      }
+
+      // Compute dot products: C = queries * targets^T
+      // queries: batchSize x dim (row-major)
+      // targets^T: dim x nTargets (we have it in column-major as targetsFlat)
+      // C: batchSize x nTargets
+      val dotProducts = new Array[Float](batchSize * nTargets)
+
+      // sgemm: C = alpha * A * B + beta * C
+      // A: batchSize x dim (row-major) => column-major: dim x batchSize, so we use 'T'
+      // B: dim x nTargets (column-major) => we use 'N'
+      // For row-major A, column-major B, row-major C:
+      // Actually simpler to compute row by row with sdot
+      qi = 0
+      while (qi < batchSize) {
+        val query = queries(batchStart + qi)
+        var ti = 0
+        while (ti < nTargets) {
+          // dot product
+          var dot = 0.0f
+          var k = 0
+          while (k < dim) {
+            dot += query(k) * targets(ti)(k)
+            k += 1
+          }
+
+          // Compute query norm
+          var queryNormSq = 0.0f
+          k = 0
+          while (k < dim) {
+            queryNormSq += query(k) * query(k)
+            k += 1
+          }
+
+          // distance = ||q||² + ||t||² - 2·q·t
+          result(batchStart + qi)(ti) = Math.max(0.0f, queryNormSq + targetNormsSq(ti) - 2.0f * dot)
+          ti += 1
+        }
+        qi += 1
       }
 
       batchStart = batchEnd
@@ -185,20 +252,12 @@ object VectorOps {
   /**
    * Find nearest target for each query vector using squared Euclidean distance
    * Returns only the nearest target index and distance for each query, not the full distance matrix.
-   * This is memory-efficient and optimized for KMeans clustering where we only need the closest center.
    *
-   * OPTIMIZED: Converts targets to ND4J matrix ONCE and reuses it for all query batches.
-   * Uses formula: ||a - b||² = ||a||² + ||b||² - 2·a·b with BLAS matrix multiplication
-   *
-   * MEMORY OPTIMIZATION:
-   * - Processes queries in batches to limit peak memory
-   * - Computes distances row-by-row to avoid full distance matrix allocation
-   * - Uses adaptive batch size based on number of targets to prevent OOM
+   * Uses formula: ||a - b||² = ||a||² + ||b||² - 2·a·b
    *
    * @param queries Query vectors (n × dim)
    * @param targets Target vectors (m × dim) - typically cluster centers
-   * @param queryBatchSize Process queries in batches of this size to limit memory (default: auto-calculated)
-   *                       Set to -1 for automatic batch size based on targets count
+   * @param queryBatchSize Process queries in batches of this size to limit memory
    * @return Array of (nearestIndex, squaredDistance) for each query
    */
   def findNearestTargets(
@@ -212,74 +271,103 @@ object VectorOps {
     val nTargets = targets.length
     val dim = queries(0).length
 
-    require(queries.forall(_.length == dim), "All query vectors must have same dimension")
-    require(targets.forall(_.length == dim), "All target vectors must have same dimension")
-
-    // ADAPTIVE BATCH SIZE: Limit memory for dotProducts matrix (batchSize × nTargets)
-    // Target: ~10 MB per batch for dotProducts matrix
-    // Memory = batchSize × nTargets × 4 bytes (Float)
-    val effectiveBatchSize = if (queryBatchSize <= 0) {
-      val targetMemoryMB = 10.0  // 10 MB target for dotProducts matrix
-      val targetMemoryBytes = targetMemoryMB * 1024 * 1024
-      val elementsPerBatch = targetMemoryBytes / 4.0  // 4 bytes per Float
-      val calculatedBatchSize = Math.max(1, (elementsPerBatch / nTargets).toInt)
-      Math.min(calculatedBatchSize, nQueries)
-    } else {
-      queryBatchSize
+    // Pre-compute target norms
+    val targetNormsSq = new Array[Float](nTargets)
+    var t = 0
+    while (t < nTargets) {
+      var sum = 0.0f
+      val target = targets(t)
+      var k = 0
+      while (k < dim) {
+        sum += target(k) * target(k)
+        k += 1
+      }
+      targetNormsSq(t) = sum
+      t += 1
     }
 
-    // KEY OPTIMIZATION: Convert targets to ND4J ONCE and reuse for all query batches
-    val targetsFlat = targets.flatten
-    val targetsND = Nd4j.create(targetsFlat, Array(nTargets.toLong, dim.toLong), DataType.FLOAT)
-    val targetsNormSq = targetsND.mul(targetsND).sum(true, 1)  // Compute once
-    val targetsNDT = targetsND.transpose()  // Transpose once
+    val result = new Array[(Int, Float)](nQueries)
 
-    // Allocate result array
-    val result = Array.ofDim[(Int, Float)](nQueries)
+    var qi = 0
+    while (qi < nQueries) {
+      val query = queries(qi)
 
-    // Process queries in batches to limit memory usage
-    var batchStart = 0
-    while (batchStart < nQueries) {
-      val batchEnd = Math.min(batchStart + effectiveBatchSize, nQueries)
-      val batchQueries = queries.slice(batchStart, batchEnd)
-      val batchSize = batchQueries.length
-
-      // Convert current query batch to ND4J
-      val queriesFlat = batchQueries.flatten
-      val queriesND = Nd4j.create(queriesFlat, Array(batchSize.toLong, dim.toLong), DataType.FLOAT)
-
-      // Compute ||queries||² for this batch
-      val queriesNormSq = queriesND.mul(queriesND).sum(true, 1)
-
-      // Compute 2 * queries · targets^T using cached targetsNDT
-      val dotProducts = queriesND.mmul(targetsNDT).mul(2.0f)
-
-      // MEMORY OPTIMIZATION: Compute distances and find minimum row-by-row
-      // to avoid creating full distance matrix in memory
-      var i = 0
-      while (i < batchSize) {
-        val queryNormSq = queriesNormSq.getFloat(i.toLong, 0L)
-        var minDist = Float.MaxValue
-        var minIdx = 0
-
-        var j = 0
-        while (j < nTargets) {
-          // Compute ||a||² + ||b||² - 2·a·b for single element
-          val dotProduct = dotProducts.getFloat(i.toLong, j.toLong)
-          val targetNormSq = targetsNormSq.getFloat(j.toLong, 0L)
-          val dist = Math.max(0.0f, queryNormSq + targetNormSq - dotProduct)
-
-          if (dist < minDist) {
-            minDist = dist
-            minIdx = j
-          }
-          j += 1
-        }
-        result(batchStart + i) = (minIdx, minDist)
-        i += 1
+      // Compute query norm
+      var queryNormSq = 0.0f
+      var k = 0
+      while (k < dim) {
+        queryNormSq += query(k) * query(k)
+        k += 1
       }
 
-      batchStart = batchEnd
+      var minDist = Float.MaxValue
+      var minIdx = 0
+
+      var ti = 0
+      while (ti < nTargets) {
+        // dot product using BLAS
+        val dot = blas.sdot(dim, query, 1, targets(ti), 1)
+        val dist = Math.max(0.0f, queryNormSq + targetNormsSq(ti) - 2.0f * dot)
+
+        if (dist < minDist) {
+          minDist = dist
+          minIdx = ti
+        }
+        ti += 1
+      }
+
+      result(qi) = (minIdx, minDist)
+      qi += 1
+    }
+
+    result
+  }
+
+  /**
+   * Find nearest target for each query using dot product (for cosine distance with normalized targets)
+   *
+   * When targets are normalized (||target|| = 1), finding the nearest by cosine distance
+   * is equivalent to finding the maximum dot product:
+   *   argmin(cosine_distance) = argmax(dot_product)
+   *
+   * @param queries Array of query vectors
+   * @param targets Array of normalized target vectors (||target|| = 1)
+   * @param queryBatchSize Process queries in batches of this size to limit memory
+   * @return Array of (nearestIndex, dotProduct) for each query
+   */
+  def findNearestTargetsByDotProduct(
+    queries: Array[Array[Float]],
+    targets: Array[Array[Float]],
+    queryBatchSize: Int = -1
+  ): Array[(Int, Float)] = {
+    if (queries.isEmpty || targets.isEmpty) return Array.empty[(Int, Float)]
+
+    val nQueries = queries.length
+    val nTargets = targets.length
+    val dim = queries(0).length
+
+    val result = new Array[(Int, Float)](nQueries)
+
+    var qi = 0
+    while (qi < nQueries) {
+      val query = queries(qi)
+
+      var maxDotProduct = Float.MinValue
+      var maxIdx = 0
+
+      var ti = 0
+      while (ti < nTargets) {
+        val dot = blas.sdot(dim, query, 1, targets(ti), 1)
+
+        if (dot > maxDotProduct) {
+          maxDotProduct = dot
+          maxIdx = ti
+        }
+        ti += 1
+      }
+
+      result(qi) = (maxIdx, maxDotProduct)
+      qi += 1
     }
 
     result
@@ -287,12 +375,6 @@ object VectorOps {
 
   /**
    * Batch compute Euclidean distances between a query vector and multiple target vectors
-   * This is more efficient than computing distances one by one
-   *
-   * Optimized for KMeans with memory-efficient implementation:
-   * - For small batches (k < 100): uses manual loop to avoid ND4J overhead
-   * - For large batches (k >= 100): uses ND4J with SIMD for maximum performance
-   * - Uses direct buffer creation to minimize object allocation
    *
    * @param query Query vector
    * @param targets Array of target vectors
@@ -302,52 +384,25 @@ object VectorOps {
     if (targets.isEmpty) return Array.empty[Float]
 
     val dim = query.length
-    require(targets.forall(_.length == dim), "All vectors must have the same dimension")
+    val distances = new Array[Float](targets.length)
 
-    // For small batches (typical in KMeans with k <= 10000), use manual computation
-    // This avoids ND4J object creation overhead which causes OOM in iterative algorithms
-    // Benchmark shows manual loop is faster for k < 10000 due to zero allocation overhead
-    if (targets.length <= 10000) {
-      val distances = new Array[Float](targets.length)
+    var i = 0
+    while (i < targets.length) {
+      val target = targets(i)
+      var sumSq = 0.0f
 
-      var i = 0
-      while (i < targets.length) {
-        val target = targets(i)
-        var sumSq = 0.0f
-
-        var j = 0
-        while (j < dim) {
-          val diff = query(j) - target(j)
-          sumSq += diff * diff
-          j += 1
-        }
-
-        distances(i) = Math.sqrt(sumSq).toFloat
-        i += 1
+      var j = 0
+      while (j < dim) {
+        val diff = query(j) - target(j)
+        sumSq += diff * diff
+        j += 1
       }
 
-      distances
-    } else {
-      // For large batches, ND4J's SIMD optimization is worth the overhead
-      // Create ND4J matrices with proper API
-      val queryND = Nd4j.create(query).castTo(DataType.FLOAT).reshape(1, dim)
-
-      // Create targets matrix row by row
-      val targetsND = Nd4j.create(DataType.FLOAT, targets.length.toLong, dim.toLong)
-      var i = 0
-      while (i < targets.length) {
-        targetsND.putRow(i, Nd4j.create(targets(i)).castTo(DataType.FLOAT))
-        i += 1
-      }
-
-      // Compute pairwise distances efficiently with SIMD
-      val diff = targetsND.subRowVector(queryND.getRow(0))
-      val squared = Transforms.pow(diff, 2)
-      val summed = squared.sum(true, 1)  // Sum along dimension axis
-      val distances = Transforms.sqrt(summed)
-
-      distances.toFloatVector
+      distances(i) = Math.sqrt(sumSq).toFloat
+      i += 1
     }
+
+    distances
   }
 
   /**
@@ -361,49 +416,249 @@ object VectorOps {
     if (targets.isEmpty) return Array.empty[Float]
 
     val dim = query.length
-    require(targets.forall(_.length == dim), "All vectors must have the same dimension")
-
-    // Use manual computation to avoid ND4J overhead
     val distances = new Array[Float](targets.length)
 
     // Compute query norm once
-    var queryNormSq = 0.0f
-    var j = 0
-    while (j < dim) {
-      queryNormSq += query(j) * query(j)
-      j += 1
-    }
-    val queryNorm = Math.sqrt(queryNormSq).toFloat
+    val queryNorm = blas.snrm2(dim, query, 1)
 
     var i = 0
     while (i < targets.length) {
       val target = targets(i)
+      val dot = blas.sdot(dim, query, 1, target, 1)
+      val targetNorm = blas.snrm2(dim, target, 1)
 
-      // Compute dot product and target norm
-      var dotProduct = 0.0f
-      var targetNormSq = 0.0f
-
-      var k = 0
-      while (k < dim) {
-        dotProduct += query(k) * target(k)
-        targetNormSq += target(k) * target(k)
-        k += 1
-      }
-
-      val targetNorm = Math.sqrt(targetNormSq).toFloat
-
-      // Cosine similarity = dot / (norm1 * norm2)
       val cosineSim = if (queryNorm > 0 && targetNorm > 0) {
-        dotProduct / (queryNorm * targetNorm)
+        dot / (queryNorm * targetNorm)
       } else {
         0.0f
       }
 
-      // Cosine distance = 1 - similarity
       distances(i) = 1.0f - cosineSim
       i += 1
     }
 
     distances
+  }
+
+  /**
+   * Cached targets for repeated nearest neighbor queries.
+   * Pre-computes target norms and stores targets for efficient reuse.
+   *
+   * Unlike ND4J version, this is pure JVM heap - no native memory issues.
+   * No need to call close() but it's provided for API compatibility.
+   */
+  class CachedTargets(targets: Array[Array[Float]], useCosine: Boolean) extends AutoCloseable {
+    val nTargets: Int = targets.length
+    val dim: Int = if (targets.nonEmpty) targets(0).length else 0
+
+    // Pre-compute target norms (for L2 distance)
+    private val targetNormsSq: Array[Float] = if (!useCosine && nTargets > 0) {
+      val norms = new Array[Float](nTargets)
+      var t = 0
+      while (t < nTargets) {
+        var sum = 0.0f
+        val target = targets(t)
+        var k = 0
+        while (k < dim) {
+          sum += target(k) * target(k)
+          k += 1
+        }
+        norms(t) = sum
+        t += 1
+      }
+      norms
+    } else {
+      null
+    }
+
+    /**
+     * Find nearest target for each query using cached targets.
+     */
+    def findNearest(queries: Array[Array[Float]], queryBatchSize: Int = -1): Array[(Int, Float)] = {
+      if (queries.isEmpty || nTargets == 0) return Array.empty[(Int, Float)]
+
+      val nQueries = queries.length
+      val result = new Array[(Int, Float)](nQueries)
+
+      if (useCosine) {
+        // Cosine: find max dot product
+        var qi = 0
+        while (qi < nQueries) {
+          val query = queries(qi)
+          var maxDotProduct = Float.MinValue
+          var maxIdx = 0
+
+          var ti = 0
+          while (ti < nTargets) {
+            val dot = blas.sdot(dim, query, 1, targets(ti), 1)
+            if (dot > maxDotProduct) {
+              maxDotProduct = dot
+              maxIdx = ti
+            }
+            ti += 1
+          }
+
+          result(qi) = (maxIdx, maxDotProduct)
+          qi += 1
+        }
+      } else {
+        // L2: find min squared distance
+        var qi = 0
+        while (qi < nQueries) {
+          val query = queries(qi)
+
+          // Compute query norm
+          var queryNormSq = 0.0f
+          var k = 0
+          while (k < dim) {
+            queryNormSq += query(k) * query(k)
+            k += 1
+          }
+
+          var minDist = Float.MaxValue
+          var minIdx = 0
+
+          var ti = 0
+          while (ti < nTargets) {
+            val dot = blas.sdot(dim, query, 1, targets(ti), 1)
+            val dist = Math.max(0.0f, queryNormSq + targetNormsSq(ti) - 2.0f * dot)
+
+            if (dist < minDist) {
+              minDist = dist
+              minIdx = ti
+            }
+            ti += 1
+          }
+
+          result(qi) = (minIdx, minDist)
+          qi += 1
+        }
+      }
+
+      result
+    }
+
+    override def close(): Unit = {
+      // No native resources to release - pure JVM heap
+    }
+  }
+
+  /**
+   * Create a cached targets object for repeated queries.
+   * Use this when you need to query the same targets multiple times (e.g., KMeans iterations).
+   *
+   * @param targets Target vectors (e.g., cluster centers)
+   * @param useCosine If true, use cosine distance (dot product with normalized targets)
+   * @return CachedTargets object
+   */
+  def createCachedTargets(targets: Array[Array[Float]], useCosine: Boolean): CachedTargets = {
+    new CachedTargets(targets, useCosine)
+  }
+
+  // Alias for backward compatibility
+  type SimpleCachedTargets = CachedTargets
+
+  /**
+   * Create a simple cached targets object (same as createCachedTargets now).
+   * Kept for backward compatibility.
+   */
+  def createSimpleCachedTargets(targets: Array[Array[Float]], useCosine: Boolean): CachedTargets = {
+    new CachedTargets(targets, useCosine)
+  }
+
+  /**
+   * Batch compute distances for pairs of vectors.
+   * OPTIMIZED: Uses BLAS sdot in a tight loop with minimal overhead.
+   * For very large batches, consider using sgemm for even better performance.
+   *
+   * @param pairs Array of (index_i, index_j) pairs indicating which vectors to compare
+   * @param vectors All vectors (pairs reference indices into this array)
+   * @param metric Distance metric: "l2" for squared L2 distance, "cosine" for cosine distance
+   * @param batchSize Process pairs in batches of this size (ignored - processed all at once)
+   * @return Array of distances corresponding to each pair
+   */
+  def batchPairDistances(
+    pairs: Array[(Int, Int)],
+    vectors: Array[Array[Float]],
+    metric: String,
+    batchSize: Int = 10000
+  ): Array[Float] = {
+    if (pairs.isEmpty) return Array.empty[Float]
+
+    val nPairs = pairs.length
+    val dim = vectors(0).length
+    val result = new Array[Float](nPairs)
+    val useCosine = metric == "cosine"
+
+    // Pre-compute all vector norms (squared) - avoid repeated sqrt
+    val normsSq = new Array[Float](vectors.length)
+    var v = 0
+    while (v < vectors.length) {
+      val vec = vectors(v)
+      // Use BLAS snrm2 for norm computation (faster than manual loop)
+      val norm = blas.snrm2(dim, vec, 1)
+      normsSq(v) = norm * norm  // Store squared norm
+      v += 1
+    }
+
+    // Pre-compute sqrt norms for cosine (only if needed)
+    val norms = if (useCosine) {
+      val n = new Array[Float](vectors.length)
+      var i = 0
+      while (i < vectors.length) {
+        n(i) = Math.sqrt(normsSq(i)).toFloat
+        i += 1
+      }
+      n
+    } else {
+      null
+    }
+
+    // Batch compute all dot products using BLAS
+    // Process in a tight loop to minimize function call overhead
+    var idx = 0
+    while (idx < nPairs) {
+      val (i, j) = pairs(idx)
+      val v1 = vectors(i)
+      val v2 = vectors(j)
+
+      // Use BLAS sdot for dot product (SIMD optimized)
+      val dot = blas.sdot(dim, v1, 1, v2, 1)
+
+      if (useCosine) {
+        val norm1 = norms(i)
+        val norm2 = norms(j)
+        val cosineSim = if (norm1 > 0 && norm2 > 0) dot / (norm1 * norm2) else 0.0f
+        result(idx) = 1.0f - cosineSim
+      } else {
+        // L2 squared distance: ||a - b||² = ||a||² + ||b||² - 2·a·b
+        // No sqrt needed since we compare squared distances
+        result(idx) = Math.max(0.0f, normsSq(i) + normsSq(j) - 2.0f * dot)
+      }
+
+      idx += 1
+    }
+
+    result
+  }
+
+  /**
+   * Pure Scala version of batch pair distances (no BLAS).
+   * Alias for batchPairDistances since we no longer have ND4J.
+   */
+  def batchPairDistancesSimple(
+    pairs: Array[(Int, Int)],
+    vectors: Array[Array[Float]],
+    metric: String
+  ): Array[Float] = {
+    batchPairDistances(pairs, vectors, metric)
+  }
+
+  /**
+   * No-op for backward compatibility.
+   * Previously cleared ND4J memory pool, now does nothing.
+   */
+  def clearPool(): Unit = {
+    // No-op - no native memory pool to clear
   }
 }

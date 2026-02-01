@@ -37,7 +37,8 @@ class KMeansOperation(
   val featuresCol: String = "features",
   val predictionCol: String = "cluster_id",
   val initMode: String = "k-means||",
-  val initSteps: Int = 2
+  val initSteps: Int = 2,
+  val distanceMetric: String = "cosine"
 ) extends Serializable {
 
   private val logger: Logger = LoggerFactory.getLogger(classOf[KMeansOperation])
@@ -49,12 +50,102 @@ class KMeansOperation(
   require(predictionCol.nonEmpty, "Prediction column name cannot be empty")
   require(initMode == "k-means||" || initMode == "random",
     s"initMode must be 'k-means||' or 'random', got: $initMode")
+  require(distanceMetric == "cosine" || distanceMetric == "l2",
+    s"distanceMetric must be 'cosine' or 'l2', got: $distanceMetric")
+
+  private val useCosine = distanceMetric == "cosine"
+
+  /**
+   * Normalize vector to unit length (L2 normalization)
+   */
+  private def normalizeL2(v: Array[Float]): Array[Float] = {
+    val norm = math.sqrt(squaredNorm(v)).toFloat
+    if (norm > 0) v.map(_ / norm) else v
+  }
+
+  /**
+   * Compute squared L2 norm of a vector
+   */
+  private def squaredNorm(v: Array[Float]): Double = {
+    var sum = 0.0
+    var i = 0
+    while (i < v.length) {
+      sum += v(i).toDouble * v(i).toDouble
+      i += 1
+    }
+    sum
+  }
+
+  /**
+   * Compute dot product of two vectors
+   */
+  private def dotProduct(v1: Array[Float], v2: Array[Float]): Float = {
+    var sum = 0.0f
+    var i = 0
+    while (i < v1.length) {
+      sum += v1(i) * v2(i)
+      i += 1
+    }
+    sum
+  }
+
+  /**
+   * Find closest center using dot product (for cosine distance with normalized centers)
+   * When centers are normalized, argmax(dot(point, center)) = argmin(cosine_distance)
+   * Returns (closestIdx, cosineDistance)
+   */
+  private def findClosestCenterByDotProduct(
+    point: Array[Float],
+    centers: Array[Array[Float]]
+  ): (Int, Float) = {
+    var closestIdx = 0
+    var maxDotProduct = dotProduct(point, centers(0))
+
+    var i = 1
+    while (i < centers.length) {
+      val dp = dotProduct(point, centers(i))
+      if (dp > maxDotProduct) {
+        maxDotProduct = dp
+        closestIdx = i
+      }
+      i += 1
+    }
+
+    // Compute cosine distance for the cost calculation
+    // cosine_distance = 1 - cosine_similarity
+    // cosine_similarity = dot(point, center) / (||point|| * ||center||)
+    // Since ||center|| = 1, we have: cosine_similarity = dot(point, center) / ||point||
+    val pointNorm = math.sqrt(squaredNorm(point)).toFloat
+    val cosineSimilarity = if (pointNorm > 0) maxDotProduct / pointNorm else 0f
+    val cosineDistance = 1f - cosineSimilarity
+
+    (closestIdx, cosineDistance)
+  }
+
+  /**
+   * Find closest center index using dot product (for cosine distance)
+   */
+  private def findClosestCenterIdxByDotProduct(point: Array[Float], centers: Array[Array[Float]]): Int = {
+    var closestIdx = 0
+    var maxDotProduct = dotProduct(point, centers(0))
+
+    var i = 1
+    while (i < centers.length) {
+      val dp = dotProduct(point, centers(i))
+      if (dp > maxDotProduct) {
+        maxDotProduct = dp
+        closestIdx = i
+      }
+      i += 1
+    }
+    closestIdx
+  }
 
   /**
    * Train K-Means model and return cluster centers
    */
   def fit(df: DataFrame): KMeansModel = {
-    logger.info(s"Training Float K-Means: k=$k, maxIter=$maxIter, initMode=$initMode, epsilon=$epsilon")
+    logger.info(s"Training Float K-Means: k=$k, maxIter=$maxIter, initMode=$initMode, epsilon=$epsilon, distanceMetric=$distanceMetric")
 
     val spark = df.sparkSession
     val startTime = System.currentTimeMillis()
@@ -82,6 +173,14 @@ class KMeansOperation(
     val initTime = System.currentTimeMillis() - initStart
     logger.info(s"Initialization completed in $initTime ms")
 
+    // Normalize centers if using cosine distance
+    if (useCosine) {
+      logger.info("Normalizing initial centers for cosine distance")
+      for (i <- centers.indices) {
+        centers(i) = normalizeL2(centers(i))
+      }
+    }
+
     // Step 2: Lloyd's iterations
     logger.info("Starting Lloyd's iterations...")
     val (finalCenters, iterations, finalCost) = lloydIterations(df, centers, maxIter, epsilon, spark)
@@ -100,7 +199,7 @@ class KMeansOperation(
     logger.info(s"Total training time: $totalTime ms")
     logger.info("=" * 60)
 
-    new KMeansModel(finalCenters, featuresCol, predictionCol)
+    new KMeansModel(finalCenters, featuresCol, predictionCol, distanceMetric)
   }
 
   /**
@@ -245,12 +344,42 @@ class KMeansOperation(
 
       // Assign each point to nearest center and compute statistics
       // Use treeAggregate to avoid collectAsMap overhead
+      val localUseCosine = useCosine  // Capture for serialization
       val stats = df.select(featuresCol).rdd.treeAggregate(
         Array.fill(centers.length)((new Array[Double](centers(0).length), 0, 0.0))
       )(
         seqOp = (localStats, row) => {
           val point = row.getAs[scala.collection.mutable.WrappedArray[Float]](0).toArray
-          val (closestCenter, distance) = findClosestCenterWithDistance(point, bcCenters.value)
+          val localCenters = bcCenters.value
+
+          // Use dot product for cosine distance, L2 for euclidean
+          val (closestCenter, distance) = if (localUseCosine) {
+            // For cosine: argmax(dot(point, center)) when centers are normalized
+            var closestIdx = 0
+            var maxDp = {
+              var sum = 0.0f
+              var j = 0
+              while (j < point.length) { sum += point(j) * localCenters(0)(j); j += 1 }
+              sum
+            }
+            var i = 1
+            while (i < localCenters.length) {
+              var dp = 0.0f
+              var j = 0
+              while (j < point.length) { dp += point(j) * localCenters(i)(j); j += 1 }
+              if (dp > maxDp) { maxDp = dp; closestIdx = i }
+              i += 1
+            }
+            // Compute cosine distance for cost
+            var pointNormSq = 0.0
+            var k = 0
+            while (k < point.length) { pointNormSq += point(k).toDouble * point(k).toDouble; k += 1 }
+            val pointNorm = math.sqrt(pointNormSq).toFloat
+            val cosineSim = if (pointNorm > 0) maxDp / pointNorm else 0f
+            (closestIdx, (1f - cosineSim).toFloat)
+          } else {
+            findClosestCenterWithDistance(point, localCenters)
+          }
 
           // Accumulate sum, count, and cost
           val (sum, count, _) = localStats(closestCenter)
@@ -278,11 +407,19 @@ class KMeansOperation(
       cost = stats.map(_._3).sum
 
       // Update centers
-      val newCenters = stats.zipWithIndex.map { case ((sum, count, _), idx) =>
+      var newCenters = stats.zipWithIndex.map { case ((sum, count, _), idx) =>
         if (count > 0) {
           sum.map(s => (s / count).toFloat)
         } else {
           centers(idx) // Keep old center if cluster is empty
+        }
+      }
+
+      // Normalize centers after update if using cosine distance
+      if (useCosine) {
+        newCenters = newCenters.map { center =>
+          val norm = math.sqrt(center.map(x => x.toDouble * x.toDouble).sum).toFloat
+          if (norm > 0) center.map(_ / norm) else center
         }
       }
 
@@ -393,10 +530,12 @@ class KMeansOperation(
 class KMeansModel(
   val clusterCenters: Array[Array[Float]],
   val featuresCol: String = "features",
-  val predictionCol: String = "cluster_id"
+  val predictionCol: String = "cluster_id",
+  val distanceMetric: String = "cosine"
 ) extends Serializable {
 
   private val logger: Logger = LoggerFactory.getLogger(classOf[KMeansModel])
+  private val useCosine = distanceMetric == "cosine"
 
   /**
    * Transform DataFrame by assigning cluster IDs and computing distances
@@ -431,42 +570,54 @@ class KMeansModel(
       .add(predictionCol, DataTypes.IntegerType, false)
       .add("distance", DataTypes.FloatType, false)
 
-    // MEMORY CONSERVATIVE: Process one vector at a time to avoid OOM
-    // No batch processing, no ND4J matrix operations - pure streaming approach
-    val resultRDD = df.rdd.map { row =>
-      val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](featuresCol).toArray
+    // MEMORY OPTIMIZED: Use mapPartitions with sub-batch processing
+    // Each partition processes vectors in small batches, releasing memory after each batch
+    val localUseCosine = useCosine  // Capture for serialization
+    val localFeaturesCol = featuresCol  // Capture for serialization
+    val subBatchSize = 5000  // Process 5000 vectors at a time per partition
+
+    val resultRDD = df.rdd.mapPartitions { iter =>
       val localCenters = bcCenters.value
+      val cachedTargets = VectorOps.createCachedTargets(localCenters, localUseCosine)
 
-      // Find closest cluster for this single vector using simple loop
-      var closestCluster = 0
-      var minDistSq = Float.MaxValue
-
-      var i = 0
-      while (i < localCenters.length) {
-        val center = localCenters(i)
-
-        // Compute squared Euclidean distance manually
-        var distSq = 0.0f
-        var j = 0
-        while (j < features.length) {
-          val diff = features(j) - center(j)
-          distSq += diff * diff
-          j += 1
+      try {
+        iter.grouped(subBatchSize).flatMap { batch =>
+          val rows = batch.toArray
+          val vectors = rows.map(_.getAs[scala.collection.mutable.WrappedArray[Float]](localFeaturesCol).toArray)
+          val assignments = cachedTargets.findNearest(vectors)
+          rows.zip(assignments).map { case (row, (clusterId, rawValue)) =>
+            val distance = if (localUseCosine) {
+              val features = row.getAs[scala.collection.mutable.WrappedArray[Float]](localFeaturesCol).toArray
+              var pointNormSq = 0.0
+              var k = 0
+              while (k < features.length) {
+                pointNormSq += features(k).toDouble * features(k).toDouble
+                k += 1
+              }
+              val pointNorm = math.sqrt(pointNormSq).toFloat
+              val cosineSim = if (pointNorm > 0) rawValue / pointNorm else 0f
+              1f - cosineSim
+            } else {
+              rawValue
+            }
+            Row.fromSeq(row.toSeq :+ clusterId :+ distance)
+          }
         }
-
-        if (distSq < minDistSq) {
-          minDistSq = distSq
-          closestCluster = i
-        }
-        i += 1
+      } finally {
+        cachedTargets.close()
       }
-
-      // Return Row with appended cluster_id and distance
-      Row.fromSeq(row.toSeq :+ closestCluster :+ minDistSq)
     }
 
     // Convert RDD back to DataFrame with output schema
-    spark.createDataFrame(resultRDD, outputSchema)
+    val result = spark.createDataFrame(resultRDD, outputSchema)
+
+    // NOTE: Do NOT destroy bcCenters here!
+    // DataFrame is lazily evaluated - destroying the broadcast before
+    // the DataFrame is materialized (e.g., via count(), collect(), write())
+    // will cause "Broadcast was destroyed" errors.
+    // Let Spark manage broadcast lifecycle automatically.
+
+    result
   }
 
   /**

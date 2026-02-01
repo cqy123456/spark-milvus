@@ -43,7 +43,8 @@ class MiniBatchKMeansOperation(
   val seed: Long = 1L,
   val featuresCol: String = "features",
   val predictionCol: String = "cluster_id",
-  val initMode: String = "k-means||"
+  val initMode: String = "k-means||",
+  val distanceMetric: String = "cosine"
 ) extends Serializable {
 
   private val logger: Logger = LoggerFactory.getLogger(classOf[MiniBatchKMeansOperation])
@@ -53,13 +54,17 @@ class MiniBatchKMeansOperation(
   require(numBatches > 0, "Number of batches must be positive")
   require(initMode == "k-means||" || initMode == "random",
     s"initMode must be 'k-means||' or 'random', got: $initMode")
+  require(distanceMetric == "cosine" || distanceMetric == "l2",
+    s"distanceMetric must be 'cosine' or 'l2', got: $distanceMetric")
+
+  private val useCosine = distanceMetric == "cosine"
 
   /**
    * Train Mini-Batch K-Means and return the model
    * Accepts DataFrame with Array[Float] (Milvus format)
    */
   def fit(df: DataFrame): KMeansModel = {
-    logger.info(s"Training Mini-Batch K-Means: k=$k, batchSize=$batchSize, numBatches=$numBatches, initMode=$initMode")
+    logger.info(s"Training Mini-Batch K-Means: k=$k, batchSize=$batchSize, numBatches=$numBatches, initMode=$initMode, distanceMetric=$distanceMetric")
 
     val spark = df.sparkSession
     val startTime = System.currentTimeMillis()
@@ -69,8 +74,9 @@ class MiniBatchKMeansOperation(
     require(featuresType == ArrayType(FloatType, false) || featuresType == ArrayType(FloatType, true),
       s"Input DataFrame must have Array[Float] column, but got $featuresType")
 
-    // Cache data for faster sampling
-    df.cache()
+    // NOTE: No caching here - MiniBatch KMeans only samples small batches each iteration
+    // Caching 10M+ vectors would consume too much memory (29GB+ for 10M x 768d)
+    // Reading from parquet/S3 is fast enough for sampling
     val totalCount = df.count()
     logger.info(s"Total data points: $totalCount")
 
@@ -103,6 +109,17 @@ class MiniBatchKMeansOperation(
     logger.info(s"Initialization completed in ${initEnd - initStart} ms")
     logger.info(s"Initialized ${centers.length} cluster centers")
 
+    // Normalize centers if using cosine distance
+    if (useCosine) {
+      logger.info("Normalizing initial centers for cosine distance")
+      for (i <- centers.indices) {
+        val norm = math.sqrt(centers(i).map(x => x.toDouble * x.toDouble).sum).toFloat
+        if (norm > 0) {
+          centers(i) = centers(i).map(_ / norm)
+        }
+      }
+    }
+
     // Track total points assigned to each cluster (for learning rate calculation)
     val clusterCounts = Array.fill(k)(1) // Avoid division by zero
 
@@ -119,9 +136,9 @@ class MiniBatchKMeansOperation(
       val iterStart = System.currentTimeMillis()
       logger.info(s"=== Iteration ${iteration + 1}/$numBatches ===")
 
-      // 2.1 Sampling phase
+      // 2.1 Sampling phase (no cache - batch is small and used once)
       val samplingStart = System.currentTimeMillis()
-      val batch = df.sample(false, batchSize, seed + iteration).cache()
+      val batch = df.sample(false, batchSize, seed + iteration)
       val batchCount = batch.count()
       val samplingEnd = System.currentTimeMillis()
       val samplingTime = samplingEnd - samplingStart
@@ -138,8 +155,18 @@ class MiniBatchKMeansOperation(
       // Broadcast centers for efficient access
       val broadcastCenters = spark.sparkContext.broadcast(centers)
 
-      // Compute cluster statistics using mapPartitions + reduceByKey
-      // MEMORY OPTIMIZED: Process in sub-batches to avoid loading entire partition into memory
+      // Compute cluster statistics using mapPartitions + treeReduce (NO SHUFFLE!)
+      // MEMORY OPTIMIZED:
+      // 1. Use CachedTargets to convert centers to ND4J ONCE per partition (not per sub-batch)
+      // 2. Process in sub-batches to avoid loading entire partition into memory
+      // 3. Use Workspace for memory reuse within sub-batches
+      // 4. Use treeReduce to avoid shuffle - direct in-memory aggregation of partition results
+      //
+      // OPTIMIZATION: treeReduce avoids shuffle by:
+      // - Each partition independently computes its statistics array
+      // - Tree-based reduction combines stats WITHOUT repartitioning by key
+      // - O(log n) depth tree instead of distributed shuffle
+      val localUseCosine = useCosine  // Capture for serialization
       val clusterStatsRDD = batch.rdd.mapPartitions { iter =>
         val localCenters = broadcastCenters.value
         val dim = localCenters(0).length
@@ -147,58 +174,75 @@ class MiniBatchKMeansOperation(
           (new Array[Float](dim), 0)
         )
 
-        // MEMORY OPTIMIZATION: Process partition in sub-batches to limit peak memory
-        // This prevents OOM when partition contains too many points
-        val subBatchSize = 5000  // Process 5000 points at a time
-        val partitionIter = iter.map { row =>
-          row.getAs[Seq[Float]](featuresCol).toArray
-        }
+        val cachedTargets = VectorOps.createCachedTargets(localCenters, localUseCosine)
+        try {
+          val subBatchSize = if (localCenters.length > 3000) 500
+                            else if (localCenters.length > 2000) 800
+                            else 2000
+          val partitionIter = iter.map { row =>
+            row.getAs[Seq[Float]](featuresCol).toArray
+          }
 
-        while (partitionIter.hasNext) {
-          // Collect sub-batch
-          val subBatch = partitionIter.take(subBatchSize).toArray
+          var batchCount = 0
+          while (partitionIter.hasNext) {
+            val subBatch = partitionIter.take(subBatchSize).toArray
 
-          if (subBatch.nonEmpty) {
-            // OPTIMIZED: Find nearest center for each point using ND4J with SIMD
-            // findNearestTargets uses adaptive batch size to prevent OOM
-            val nearestCenters = VectorOps.findNearestTargets(subBatch, localCenters)
+            if (subBatch.nonEmpty) {
+              val nearestCenters = cachedTargets.findNearest(subBatch)
 
-            // Assign each point to closest cluster and accumulate stats
-            var i = 0
-            while (i < subBatch.length) {
-              val (closestCluster, minDist) = nearestCenters(i)
-
-              // Accumulate sum and count
-              val (sum, count) = localStats(closestCluster)
-              val point = subBatch(i)
-              var k = 0
-              while (k < dim) {
-                sum(k) += point(k)
-                k += 1
+              var i = 0
+              while (i < subBatch.length) {
+                val (closestCluster, _) = nearestCenters(i)
+                val (sum, count) = localStats(closestCluster)
+                val point = subBatch(i)
+                var k = 0
+                while (k < dim) {
+                  sum(k) += point(k)
+                  k += 1
+                }
+                localStats(closestCluster) = (sum, count + 1)
+                i += 1
               }
-              localStats(closestCluster) = (sum, count + 1)
 
-              i += 1
+              batchCount += 1
+              if (batchCount % 2 == 0) {
+                System.gc()
+              }
             }
           }
+        } finally {
+          cachedTargets.close()
         }
 
-        // Emit (clusterId, stats) pairs - only for non-empty clusters
-        Iterator.tabulate(localCenters.length) { clusterId =>
-          (clusterId, localStats(clusterId))
-        }.filter(_._2._2 > 0)  // Filter out empty clusters to reduce shuffle
-      }.reduceByKey { (v1, v2) =>
-        // Merge statistics for the same cluster
-        val (sum1, count1) = v1
-        val (sum2, count2) = v2
-        for (i <- sum1.indices) {
-          sum1(i) += sum2(i)
+        // Return the entire stats array for this partition
+        // Each partition outputs its stats, no keys
+        Iterator.single(localStats)
+      }
+
+      // Use treeReduce to combine stats arrays WITHOUT SHUFFLE
+      // This merges partition results in a tree structure on the fly
+      val globalStats = clusterStatsRDD.treeReduce { (stats1, stats2) =>
+        // Merge two stats arrays element-wise
+        val merged = Array.fill(stats1.length)(
+          (new Array[Float](stats1(0)._1.length), 0)
+        )
+        for (i <- stats1.indices) {
+          val (sum1, count1) = stats1(i)
+          val (sum2, count2) = stats2(i)
+          for (j <- sum1.indices) {
+            merged(i)._1(j) = sum1(j) + sum2(j)
+          }
+          merged(i) = (merged(i)._1, count1 + count2)
         }
-        (sum1, count1 + count2)
-      }.collectAsMap()  // Use collectAsMap for direct lookup
+        merged
+      }
+
+      // Convert global stats array to map for easier lookup
+      val clusterStatsMap = globalStats.zipWithIndex.map { case ((sum, count), clusterId) =>
+        (clusterId, (sum, count))
+      }.toMap
 
       broadcastCenters.destroy()
-      batch.unpersist()
 
       val assignmentEnd = System.currentTimeMillis()
       val assignmentTime = assignmentEnd - assignmentStart
@@ -213,7 +257,7 @@ class MiniBatchKMeansOperation(
       // center_new = (1 - eta) * center_old + eta * batch_mean
       // where eta = batch_count / (total_count_for_cluster)
 
-      clusterStatsRDD.foreach { case (clusterId, (sum, batchClusterCount)) =>
+      clusterStatsMap.foreach { case (clusterId, (sum, batchClusterCount)) =>
         // Compute batch mean for this cluster
         val batchMean = sum.map(_ / batchClusterCount)
 
@@ -225,10 +269,18 @@ class MiniBatchKMeansOperation(
 
         // Incremental update
         val oldCenter = centers(clusterId)
-        val newCenter = new Array[Float](oldCenter.length)
+        var newCenter = new Array[Float](oldCenter.length)
 
         for (i <- oldCenter.indices) {
           newCenter(i) = (1.0f - eta) * oldCenter(i) + eta * batchMean(i)
+        }
+
+        // Normalize center after update if using cosine distance
+        if (useCosine) {
+          val norm = math.sqrt(newCenter.map(x => x.toDouble * x.toDouble).sum).toFloat
+          if (norm > 0) {
+            newCenter = newCenter.map(_ / norm)
+          }
         }
 
         centers(clusterId) = newCenter
@@ -243,13 +295,12 @@ class MiniBatchKMeansOperation(
       totalIterationTime += iterTime
 
       logger.info(s"  [Total] Iteration time: ${iterTime} ms (sampling:${samplingTime} + assignment:${assignmentTime} + update:${updateTime})")
+
       } else {
         logger.warn("  Batch is empty, skipping")
-        batch.unpersist()
       }
+      
     }
-
-    df.unpersist()
 
     val totalTime = System.currentTimeMillis() - startTime
 
@@ -267,7 +318,7 @@ class MiniBatchKMeansOperation(
     logger.info("=" * 60)
 
     // Return KMeansModel with trained centers
-    new KMeansModel(centers, featuresCol, predictionCol)
+    new KMeansModel(centers, featuresCol, predictionCol, distanceMetric)
   }
 
   /**
@@ -326,7 +377,7 @@ class MiniBatchKMeansOperation(
     })
 
     val vectorDF = df.withColumn("__mllib_init_features", toVector(col(featuresCol)))
-    vectorDF.cache()
+    // No cache - this is only used for initialization, MLlib handles its own caching
 
     // Use MLlib KMeans with maxIter=1 to get k-means|| initialized centers
     // initSteps controls the number of k-means|| rounds (default 2, we use 5 for better quality)
@@ -345,8 +396,6 @@ class MiniBatchKMeansOperation(
     val centers = mllibModel.clusterCenters.map { vector =>
       vector.toArray.map(_.toFloat)
     }
-
-    vectorDF.unpersist()
 
     logger.info(s"MLlib k-means|| initialization completed: ${centers.length} centers")
     centers

@@ -492,48 +492,46 @@ class VectorDedupApp(
           k += 1
         }
 
-        // Inline distance computation
-        def computeL2DistanceSq(v1: Array[Float], v2: Array[Float]): Float = {
-          var sumSq = 0.0f
-          var idx = 0
-          val len = v1.length
-          while (idx < len) {
-            val diff = v1(idx) - v2(idx)
-            sumSq += diff * diff
-            idx += 1
-          }
-          sumSq
-        }
-
-        def computeCosineDistance(v1: Array[Float], v2: Array[Float]): Float = {
-          var dotProduct = 0.0f
-          var norm1Sq = 0.0f
-          var norm2Sq = 0.0f
-          var idx = 0
-          val len = v1.length
-          while (idx < len) {
-            dotProduct += v1(idx) * v2(idx)
-            norm1Sq += v1(idx) * v1(idx)
-            norm2Sq += v2(idx) * v2(idx)
-            idx += 1
-          }
-          val norm1 = math.sqrt(norm1Sq).toFloat
-          val norm2 = math.sqrt(norm2Sq).toFloat
-          if (norm1 > 0 && norm2 > 0) {
-            1.0f - (dotProduct / (norm1 * norm2))
-          } else {
-            1.0f
-          }
-        }
-
         var edgeCount = 0
         var prunedByLowerBound = 0L
         var prunedByUpperBound = 0L
+        var candidateCount = 0L  // Track total candidates for logging
 
-        // Full pairwise comparison with triangle inequality pruning
+        // Process candidates in streaming chunks to avoid OOM on large buckets
+        // Instead of collecting all candidates first, we process them in chunks as we generate them
+        val thresholdVal = if (useCosine) threshold else thresholdSq
+        // Further reduce chunkSize to prevent OOM on very large buckets
+        // Smaller chunks = less memory per allocation, more frequent processing
+        val chunkSize = 2000  // Process 2K pairs at a time (reduced from 5K to prevent OOM)
+        val candidates = new scala.collection.mutable.ArrayBuffer[(Int, Int)](chunkSize)  // Pre-allocate with initial capacity
+
+        // Helper function to process a chunk of candidates
+        def processCandidateChunk(): Unit = {
+          if (candidates.nonEmpty) {
+            val chunk = candidates.toArray
+            candidateCount += chunk.length  // Track total candidates processed
+            candidates.clear()  // Free memory immediately
+
+            // Use ND4J with Workspace for SIMD acceleration and memory reuse
+            val distances = VectorOps.batchPairDistances(chunk, featureVectors, metric, chunk.length)
+
+            // Union pairs that are within threshold
+            var idx = 0
+            while (idx < chunk.length) {
+              if (distances(idx) < thresholdVal) {
+                val (pi, pj) = chunk(idx)
+                union(pi, pj)
+                edgeCount += 1
+              }
+              idx += 1
+            }
+          }
+        }
+
+        // Phase 1 & 2 combined: Generate candidates and process in chunks
+        // This avoids collecting all candidates in memory at once
         var i = 0
         while (i < totalVectors) {
-          val features_i = featureVectors(i)
           val dist_i = distToCenter(i)
           var j = i + 1
           while (j < totalVectors) {
@@ -541,14 +539,15 @@ class VectorDedupApp(
             val distDiff = math.abs(dist_i - dist_j)
 
             if (useCosine) {
-              // Cosine: lower bound pruning
+              // Cosine: lower bound pruning only
               if (distDiff > threshold) {
                 prunedByLowerBound += 1
               } else {
-                val dist = computeCosineDistance(features_i, featureVectors(j))
-                if (dist < threshold) {
-                  union(i, j)
-                  edgeCount += 1
+                // Need actual distance computation - add to chunk
+                candidates += ((i, j))
+                // Process chunk when it reaches chunkSize
+                if (candidates.size >= chunkSize) {
+                  processCandidateChunk()
                 }
               }
             } else {
@@ -558,14 +557,16 @@ class VectorDedupApp(
               } else {
                 val distSum = dist_i + dist_j
                 if (distSum < threshold) {
+                  // Upper bound: definitely duplicates, union directly
                   union(i, j)
                   edgeCount += 1
                   prunedByUpperBound += 1
                 } else {
-                  val distSq = computeL2DistanceSq(features_i, featureVectors(j))
-                  if (distSq < thresholdSq) {
-                    union(i, j)
-                    edgeCount += 1
+                  // Need actual distance computation - add to chunk
+                  candidates += ((i, j))
+                  // Process chunk when it reaches chunkSize
+                  if (candidates.size >= chunkSize) {
+                    processCandidateChunk()
                   }
                 }
               }
@@ -574,6 +575,9 @@ class VectorDedupApp(
           }
           i += 1
         }
+
+        // Process any remaining candidates in the buffer
+        processCandidateChunk()
 
         // Compute min distance per component (locally, no shuffle!)
         val componentMinDist = scala.collection.mutable.HashMap[Long, Float]()
@@ -592,11 +596,10 @@ class VectorDedupApp(
         }
 
         val totalPairs = totalVectors.toLong * (totalVectors - 1) / 2
-        val computed = totalPairs - prunedByLowerBound - prunedByUpperBound
         val componentCount = componentMinDist.size
         logger.info(f"  Bucket $bucketId: $totalVectors vectors, $edgeCount edges, $componentCount components, " +
           f"pruned: ${prunedByLowerBound + prunedByUpperBound} (lower=$prunedByLowerBound, upper=$prunedByUpperBound), " +
-          f"computed: $computed/${totalPairs} (${computed * 100.0 / totalPairs}%.1f%%)")
+          f"candidates: $candidateCount/${totalPairs} (${if (totalPairs > 0) candidateCount * 100.0 / totalPairs else 0.0}%.1f%%)")
 
         // Output complete rows with component_id and is_representative
         vectors.indices.iterator.map { idx =>

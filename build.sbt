@@ -147,7 +147,11 @@ lazy val root = (project in file("."))
       arrowMemoryNetty,
       arrowCData,
       // graphframes removed - not available for Spark 4.0
-      nd4jNative
+      // netlib-java for optimized BLAS (replaces ND4J - no off-heap memory issues)
+      netlibJava,
+      netlibJavaNativeRef,  // NativeRefBLAS 需要的原生库
+      netlibJavaNativeSystem,  // NativeSystemBLAS 需要的原生库（备用）
+      breeze
     ),
 
     Compile / PB.protoSources += baseDirectory.value / "milvus-proto/proto",
@@ -223,15 +227,15 @@ assembly / assemblyMergeStrategy := {
   // Handle @nowarn annotation conflicts between scala-library and scala-collection-compat
   case PathList("scala", "annotation", "nowarn.class") => MergeStrategy.first
   case PathList("scala", "annotation", "nowarn$.class") => MergeStrategy.first
-  // Handle javax.annotation conflicts between jsr305 and nd4j guava
+  // Handle javax.annotation conflicts between jsr305 and other libs
   case PathList("javax", "annotation", xs @ _*) => MergeStrategy.first
   // Discard Java multi-release jar entries (versions 11, 17, 21) to avoid conflicts
   case PathList("META-INF", "versions", _, xs @ _*) => MergeStrategy.first
-  // Handle protobuf conflicts between protobuf-java and nd4j protobuf
+  // Handle protobuf conflicts
   case PathList("google", "protobuf", xs @ _*) if xs.last.endsWith(".proto") => MergeStrategy.first
-  // Handle guava conflicts with nd4j protobuf (publicsuffix classes)
+  // Handle guava conflicts (publicsuffix classes)
   case PathList("com", "google", "thirdparty", "publicsuffix", xs @ _*) => MergeStrategy.first
-  // Handle META-INF native-image conflicts from JavaCPP and ND4J
+  // Handle META-INF native-image conflicts
   case PathList("META-INF", "native-image", _*) => MergeStrategy.first
   // Default case
   case x =>
@@ -291,7 +295,7 @@ lazy val benchmarks = (project in file("benchmarks"))
       case PathList("scala", "annotation", "nowarn.class") => MergeStrategy.first
       case PathList("scala", "annotation", "nowarn$.class") => MergeStrategy.first
       case PathList("javax", "annotation", xs @ _*) => MergeStrategy.first
-      case PathList("META-INF", "versions", "21", xs @ _*) => MergeStrategy.discard
+      case PathList("META-INF", "versions", _, xs @ _*) => MergeStrategy.first
       case PathList("google", "protobuf", xs @ _*) if xs.last.endsWith(".proto") => MergeStrategy.first
       case PathList("com", "google", "thirdparty", "publicsuffix", xs @ _*) => MergeStrategy.first
       case PathList("META-INF", "native-image", _*) => MergeStrategy.first

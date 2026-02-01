@@ -71,10 +71,15 @@ object Dependencies {
   // Note: GraphFrames not yet available for Spark 4.0, disabled for now
   // lazy val graphframes = "graphframes" % "graphframes" % "0.8.4-spark3.5-s_2.12"
 
-  // ND4J for optimized linear algebra and vector operations
-  // nd4j-native-platform: CPU backend with AVX/AVX2/AVX-512 optimizations
-  // For GPU support, replace with nd4j-cuda-11.8-platform (requires CUDA 11.8+)
-  lazy val nd4jVersion = "1.0.0-M2.1"
-  lazy val nd4jNative = "org.nd4j" % "nd4j-native-platform" % nd4jVersion
-  // lazy val nd4jCuda = "org.nd4j" % "nd4j-cuda-11.8-platform" % nd4jVersion  // Uncomment for GPU support
+  // netlib-java for optimized BLAS operations (SIMD accelerated)
+  // Automatically uses native BLAS (OpenBLAS, MKL) when available, falls back to pure Java
+  // No off-heap memory management issues like ND4J
+  lazy val netlibJava = "com.github.fommil.netlib" % "all" % "1.1.2" pomOnly()
+  // 添加原生库依赖：自动包含 OpenBLAS 原生库（类似 ND4J，不需要系统安装）
+  // 这样就不需要修改 Docker 镜像或运行时安装 OpenBLAS
+  // NativeRefBLAS 需要 netlib-native_ref，而不是 netlib-native_system
+  // 同时包含两个库以确保兼容性
+  lazy val netlibJavaNativeRef = "com.github.fommil.netlib" % "netlib-native_ref-linux-x86_64" % "1.1"
+  lazy val netlibJavaNativeSystem = "com.github.fommil.netlib" % "netlib-native_system-linux-x86_64" % "1.1"
+  lazy val breeze = "org.scalanlp" %% "breeze" % "2.1.0"  // Scala wrapper for netlib-java
 }
