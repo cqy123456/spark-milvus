@@ -357,24 +357,61 @@ class VectorDedupApp(
    *         (repartitioned by cluster_id, sorted by distance within each partition)
    */
   private def repartitionAndSortByClusters(df: DataFrame): DataFrame = {
-    logger.info("Step 2: Repartitioning by cluster_id and sorting by distance...")
+    logger.info("Step 2: Repartitioning by cluster_id with greedy bin packing for load balancing...")
     val startTime = System.currentTimeMillis()
 
     val spark = df.sparkSession
+    import spark.implicits._
 
-    // Get cluster count for determining partitions
-    val clusterCount = df.select("cluster_id").distinct().count().toInt
-    logger.info(s"Number of clusters: $clusterCount")
+    // 1. Compute cluster sizes
+    val clusterSizes = df.groupBy("cluster_id")
+      .agg(count("*").as("cnt"))
+      .collect()
+      .map(row => (row.getAs[Int]("cluster_id"), row.getAs[Long]("cnt")))
+      .toMap
 
-    // Use DataFrame API for memory-efficient repartitioning and sorting
-    // This avoids loading entire partitions into memory (unlike RDD toSeq.sortBy)
-    logger.info(s"Repartitioning into $clusterCount partitions by cluster_id...")
+    val numClusters = clusterSizes.size
+    val totalRows = clusterSizes.values.sum
+    logger.info(s"Number of clusters: $numClusters, total rows: $totalRows")
 
-    // repartition by cluster_id ensures same cluster goes to same partition
-    // sortWithinPartitions uses external sort, avoiding OOM on large partitions
+    // 2. Determine target number of partitions
+    val targetRowsPerPartition = 500000L  // Target 500K rows per partition
+    val numPartitions = math.max(
+      spark.sparkContext.defaultParallelism,
+      math.min(numClusters, ((totalRows - 1) / targetRowsPerPartition + 1).toInt)
+    )
+    logger.info(s"Target partitions: $numPartitions")
+
+    // 3. Greedy bin packing: assign clusters to partitions for balanced load
+    val clusterToPartition = greedyBinPacking(clusterSizes, numPartitions)
+
+    // 4. Log partition balance statistics
+    val partitionSizes = clusterToPartition.toSeq
+      .groupBy(_._2)
+      .map { case (partId, clusters) =>
+        partId -> clusters.map { case (cid, _) => clusterSizes(cid) }.sum
+      }
+
+    val maxSize = partitionSizes.values.max
+    val minSize = partitionSizes.values.min
+    val avgSize = totalRows.toDouble / numPartitions
+    val skewRatio = maxSize.toDouble / avgSize
+
+    logger.info(f"Partition balance - min: $minSize, max: $maxSize, avg: $avgSize%.0f, skew: $skewRatio%.2fx")
+
+    // 5. Broadcast the mapping
+    val clusterToPartitionBC = spark.sparkContext.broadcast(clusterToPartition)
+
+    // 6. Repartition using greedy assignment
+    val partitionUDF = udf { clusterId: Int =>
+      clusterToPartitionBC.value.getOrElse(clusterId, clusterId % numPartitions)
+    }
+
     val sortedDF = df
-      .repartition(clusterCount, col("cluster_id"))
+      .withColumn("_partition_id", partitionUDF(col("cluster_id")))
+      .repartition(numPartitions, col("_partition_id"))
       .sortWithinPartitions(col("cluster_id"), col("distance").asc)
+      .drop("_partition_id")
 
     val repartitionTime = (System.currentTimeMillis() - startTime) / 1000.0
     logger.info(f"✓ Repartitioning and sorting completed in $repartitionTime%.2f seconds")
@@ -384,20 +421,50 @@ class VectorDedupApp(
     logger.info(s"Final number of partitions: $finalPartitions")
 
     // Log bucket (cluster) size distribution
-    val bucketStats = sortedDF
-      .groupBy("cluster_id")
-      .agg(count("*").as("count"))
-      .orderBy("cluster_id")
-      .collect()
-
     logger.info("Bucket entries distribution:")
-    bucketStats.foreach { row =>
-      val clusterId = row.getAs[Int]("cluster_id")
-      val count = row.getAs[Long]("count")
-      logger.info(s"  Bucket $clusterId: $count entries")
+    clusterSizes.toSeq.sortBy(_._1).foreach { case (clusterId, count) =>
+      val partitionId = clusterToPartition(clusterId)
+      logger.info(s"  Bucket $clusterId: $count entries -> partition $partitionId")
     }
 
     sortedDF
+  }
+
+  /**
+   * Greedy bin packing algorithm to assign clusters to partitions for balanced load.
+   *
+   * Algorithm: Sort clusters by size descending, then assign each cluster to the
+   * partition with the smallest current total size.
+   *
+   * @param clusterSizes Map of clusterId -> row count
+   * @param numPartitions Number of target partitions
+   * @return Map of clusterId -> partitionId
+   */
+  private def greedyBinPacking(
+    clusterSizes: Map[Int, Long],
+    numPartitions: Int
+  ): Map[Int, Int] = {
+    // Sort clusters by size descending
+    val sortedClusters = clusterSizes.toSeq.sortBy(-_._2)
+
+    // Min-heap: (current partition size, partition ID)
+    val partitionHeap = scala.collection.mutable.PriorityQueue[(Long, Int)]()(
+      Ordering.by[(Long, Int), Long](_._1).reverse  // Min-heap
+    )
+
+    // Initialize all partitions as empty
+    (0 until numPartitions).foreach(i => partitionHeap.enqueue((0L, i)))
+
+    val clusterToPartition = scala.collection.mutable.HashMap[Int, Int]()
+
+    // Greedy assignment: put largest cluster into smallest partition
+    sortedClusters.foreach { case (clusterId, size) =>
+      val (currentSize, partitionId) = partitionHeap.dequeue()
+      clusterToPartition(clusterId) = partitionId
+      partitionHeap.enqueue((currentSize + size, partitionId))
+    }
+
+    clusterToPartition.toMap
   }
 
   /**
