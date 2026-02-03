@@ -218,18 +218,24 @@ class VectorDedupApp(
     // All without any shuffle operations!
     stepStart = System.currentTimeMillis()
     val dedupedDF = buildGraphFindComponentsAndDeduplicate(sortedDF)
-    dedupedDF.cache()
 
-    // Compute statistics
+    // Cache first to avoid recomputing the entire DataFrame multiple times
+    // This is critical because count() operations will trigger full recomputation
+    dedupedDF.cache()
+    
+    // Compute all statistics in a single pass to avoid multiple DataFrame scans
+    // Use agg() to compute multiple statistics at once
     val stats = dedupedDF.agg(
       count("*").as("total"),
-      sum(when(col("is_representative"), 1).otherwise(0)).as("representatives"),
-      countDistinct("component_id").as("components")
+      sum(when(col("is_representative"), 1).otherwise(0)).as("representatives")
     ).head()
-
+    
     val total = stats.getAs[Long]("total")
     val representatives = stats.getAs[Long]("representatives")
-    val componentCount = stats.getAs[Long]("components")
+    
+    // Component count still needs a separate operation (distinct requires shuffle)
+    // But now dedupedDF is cached, so this is faster
+    val componentCount = dedupedDF.select("component_id").distinct().count()
     val duplicates = total - representatives
     val deduplicationRate = duplicates.toDouble / total * 100
 
@@ -259,8 +265,8 @@ class VectorDedupApp(
     saveFinalResults(dedupedDF)
 
     // Unpersist cached DataFrames
-    sortedDF.unpersist()
-    dedupedDF.unpersist()
+    // NOTE: clusteredDF and sortedDF are not cached to avoid OOM on large S3 datasets
+    dedupedDF.unpersist()  // Only unpersist dedupedDF which is cached at line 224
 
     val totalDuration = (System.currentTimeMillis() - pipelineStartTime) / 1000.0
     val timingStats = DedupTimingStats(stepTimings.toSeq, totalDuration)
@@ -323,7 +329,9 @@ class VectorDedupApp(
     logger.info("Assigning cluster IDs and computing distances...")
     val transformStartTime = System.currentTimeMillis()
     val clusteredDF = model.transform(df)
-    clusteredDF.cache().count()
+    // NOTE: Avoid caching here for large S3 datasets to prevent OOM during serialization
+    // The count() is only for timing measurement, not for caching the data
+    clusteredDF.count()  // Trigger computation without caching to avoid OOM
     val transformTime = (System.currentTimeMillis() - transformStartTime) / 1000.0
     logger.info(f"✓ Transform and distance computation completed in $transformTime%.2f seconds")
 
@@ -492,6 +500,20 @@ class VectorDedupApp(
           k += 1
         }
 
+        // Pre-compute vector norms once for the entire bucket (shared across all chunks)
+        // This avoids repeated norm calculations in batchPairDistances
+        val normsSq = new Array[Float](totalVectors)
+        val norms = if (useCosine) new Array[Float](totalVectors) else null
+        k = 0
+        while (k < totalVectors) {
+          val norm = VectorOps.norm2(featureVectors(k))
+          normsSq(k) = norm * norm
+          if (useCosine) {
+            norms(k) = norm
+          }
+          k += 1
+        }
+
         var edgeCount = 0
         var prunedByLowerBound = 0L
         var prunedByUpperBound = 0L
@@ -512,8 +534,8 @@ class VectorDedupApp(
             candidateCount += chunk.length  // Track total candidates processed
             candidates.clear()  // Free memory immediately
 
-            // Use ND4J with Workspace for SIMD acceleration and memory reuse
-            val distances = VectorOps.batchPairDistances(chunk, featureVectors, metric, chunk.length)
+            // Use pre-computed norms to avoid repeated calculations
+            val distances = VectorOps.batchPairDistances(chunk, featureVectors, metric, normsSq, norms)
 
             // Union pairs that are within threshold
             var idx = 0
@@ -704,48 +726,58 @@ class VectorDedupApp(
           k += 1
         }
 
-        // Inline distance computation
-        def computeL2DistanceSq(v1: Array[Float], v2: Array[Float]): Float = {
-          var sumSq = 0.0f
-          var idx = 0
-          val len = v1.length
-          while (idx < len) {
-            val diff = v1(idx) - v2(idx)
-            sumSq += diff * diff
-            idx += 1
+        // Pre-compute vector norms once for the entire bucket (shared across all chunks)
+        // This avoids repeated norm calculations in batchPairDistances
+        val normsSq = new Array[Float](totalVectors)
+        val norms = if (useCosine) new Array[Float](totalVectors) else null
+        k = 0
+        while (k < totalVectors) {
+          val norm = VectorOps.norm2(featureVectors(k))
+          normsSq(k) = norm * norm
+          if (useCosine) {
+            norms(k) = norm
           }
-          sumSq
-        }
-
-        def computeCosineDistance(v1: Array[Float], v2: Array[Float]): Float = {
-          var dotProduct = 0.0f
-          var norm1Sq = 0.0f
-          var norm2Sq = 0.0f
-          var idx = 0
-          val len = v1.length
-          while (idx < len) {
-            dotProduct += v1(idx) * v2(idx)
-            norm1Sq += v1(idx) * v1(idx)
-            norm2Sq += v2(idx) * v2(idx)
-            idx += 1
-          }
-          val norm1 = math.sqrt(norm1Sq).toFloat
-          val norm2 = math.sqrt(norm2Sq).toFloat
-          if (norm1 > 0 && norm2 > 0) {
-            1.0f - (dotProduct / (norm1 * norm2))
-          } else {
-            1.0f
-          }
+          k += 1
         }
 
         var edgeCount = 0
         var prunedByLowerBound = 0L
         var prunedByUpperBound = 0L
+        var candidateCount = 0L  // Track total candidates for logging
+
+        // Process candidates in streaming chunks to avoid OOM on large buckets
+        // Use VectorOps.batchPairDistances for optimized native AVX-512 computation
+        val thresholdVal = if (useCosine) threshold else thresholdSq
+        val chunkSize = 2000  // Process 2K pairs at a time to prevent OOM
+        val candidates = new scala.collection.mutable.ArrayBuffer[(Int, Int)](chunkSize)  // Pre-allocate with initial capacity
+
+        // Helper function to process a chunk of candidates using VectorOps
+        def processCandidateChunk(): Unit = {
+          if (candidates.nonEmpty) {
+            val chunk = candidates.toArray
+            candidateCount += chunk.length  // Track total candidates processed
+            candidates.clear()  // Free memory immediately
+
+            // Use pre-computed norms to avoid repeated calculations
+            val distances = VectorOps.batchPairDistances(chunk, featureVectors, metric, normsSq, norms)
+
+            // Union pairs that are within threshold
+            var idx = 0
+            while (idx < chunk.length) {
+              if (distances(idx) < thresholdVal) {
+                val (pi, pj) = chunk(idx)
+                union(pi, pj)
+                edgeCount += 1
+              }
+              idx += 1
+            }
+          }
+        }
 
         // Full pairwise comparison with triangle inequality pruning
+        // Generate candidates and process in chunks to avoid OOM
         var i = 0
         while (i < totalVectors) {
-          val features_i = featureVectors(i)
           val dist_i = distToCenter(i)
           var j = i + 1
           while (j < totalVectors) {
@@ -758,10 +790,11 @@ class VectorDedupApp(
               if (distDiff > threshold) {
                 prunedByLowerBound += 1
               } else {
-                val dist = computeCosineDistance(features_i, featureVectors(j))
-                if (dist < threshold) {
-                  union(i, j)
-                  edgeCount += 1
+                // Need actual distance computation - add to chunk
+                candidates += ((i, j))
+                // Process chunk when it reaches chunkSize
+                if (candidates.size >= chunkSize) {
+                  processCandidateChunk()
                 }
               }
             } else {
@@ -777,11 +810,11 @@ class VectorDedupApp(
                   edgeCount += 1
                   prunedByUpperBound += 1
                 } else {
-                  // Need actual distance computation
-                  val distSq = computeL2DistanceSq(features_i, featureVectors(j))
-                  if (distSq < thresholdSq) {
-                    union(i, j)
-                    edgeCount += 1
+                  // Need actual distance computation - add to chunk
+                  candidates += ((i, j))
+                  // Process chunk when it reaches chunkSize
+                  if (candidates.size >= chunkSize) {
+                    processCandidateChunk()
                   }
                 }
               }
@@ -791,11 +824,13 @@ class VectorDedupApp(
           i += 1
         }
 
+        // Process any remaining candidates in the buffer
+        processCandidateChunk()
+
         val totalPairs = totalVectors.toLong * (totalVectors - 1) / 2
-        val computed = totalPairs - prunedByLowerBound - prunedByUpperBound
         logger.info(f"  Bucket $bucketId: $totalVectors vectors, $edgeCount edges, " +
           f"pruned: ${prunedByLowerBound + prunedByUpperBound} (lower=$prunedByLowerBound, upper=$prunedByUpperBound), " +
-          f"computed: $computed/${totalPairs} (${computed * 100.0 / totalPairs}%.1f%%)")
+          f"candidates: $candidateCount/${totalPairs} (${if (totalPairs > 0) candidateCount * 100.0 / totalPairs else 0.0}%.1f%%)")
 
         // Output: (id, component_id) where component_id is the id of the root
         vectors.indices.iterator.map { idx =>

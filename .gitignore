@@ -13,3 +13,4 @@ note.md
 build/
 src/main/resources/native/libmilvus-storage.so
 src/main/resources/native/libmilvus-storage-jni.so
+src/main/resources/native/libvectorops_avx512.so

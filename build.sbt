@@ -70,6 +70,38 @@ ThisBuild / developers := List(
   )
 )
 
+// Task to build native C++ library (AVX-512 vector operations)
+lazy val buildNativeLib = taskKey[Unit]("Build native AVX-512 vector operations library")
+
+buildNativeLib := {
+  val log = streams.value.log
+  val cppDir = baseDirectory.value / "src" / "main" / "cpp"
+  val targetDir = baseDirectory.value / "src" / "main" / "resources" / "native"
+  val libName = "libvectorops_avx512.so"
+
+  if (!(targetDir / libName).exists()) {
+    log.info("Building native AVX-512 vector operations library...")
+    val buildScript = cppDir / "build.sh"
+    if (buildScript.exists()) {
+      val exitCode = Process(Seq("bash", buildScript.getAbsolutePath), cppDir).!
+      if (exitCode != 0) {
+        log.warn(s"Native library build failed with exit code $exitCode. Will use pure Scala fallback.")
+      } else {
+        // Copy built library to resources
+        val builtLib = cppDir / "build" / libName
+        if (builtLib.exists()) {
+          IO.copyFile(builtLib, targetDir / libName)
+          log.info(s"Native library built and copied to ${targetDir / libName}")
+        }
+      }
+    } else {
+      log.warn(s"Build script not found at $buildScript. Will use pure Scala fallback.")
+    }
+  } else {
+    log.info("Native library already exists, skipping build.")
+  }
+}
+
 lazy val root = (project in file("."))
   .settings(
     name := "spark-connector",
@@ -168,6 +200,9 @@ lazy val root = (project in file("."))
       }
     },
     Compile / resourceDirectories += baseDirectory.value / "src" / "main" / "resources",
+    // Build native library before compile and assembly
+    Compile / compile := (Compile / compile).dependsOn(buildNativeLib).value,
+    assembly := assembly.dependsOn(buildNativeLib).value,
     // 发布 assembly JAR 作为单独的 artifact，带 classifier
     assembly / artifact := {
       val art = (assembly / artifact).value

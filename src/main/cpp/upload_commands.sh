@@ -1,0 +1,27 @@
+#!/bin/bash
+# Native library upload commands
+
+LIB_PATH="/home/ubuntu/spark-milvus/src/main/cpp/build/libvectorops_avx512.so"
+S3_PATH="s3://vdc-cloud-dev/SessionStage/job-02f46718f29vfqaxrsuvjw/cqy-dedup/native-libs/libvectorops_avx512.so"
+
+echo "=========================================="
+echo "Native Library Upload Commands"
+echo "=========================================="
+echo ""
+echo "1. Check library file:"
+echo "   ls -lh $LIB_PATH"
+echo ""
+echo "2. Upload to S3:"
+echo "   aws s3 cp $LIB_PATH $S3_PATH"
+echo ""
+echo "3. Verify upload:"
+echo "   aws s3 ls s3://vdc-cloud-dev/SessionStage/job-02f46718f29vfqaxrsuvjw/cqy-dedup/native-libs/"
+echo ""
+echo "4. Set permissions (if needed):"
+echo "   aws s3 cp $LIB_PATH $S3_PATH --acl public-read"
+echo ""
+echo "=========================================="
+echo "Quick upload command:"
+echo "=========================================="
+echo "aws s3 cp $LIB_PATH $S3_PATH"
+echo ""

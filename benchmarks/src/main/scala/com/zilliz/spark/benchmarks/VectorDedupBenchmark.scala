@@ -258,15 +258,9 @@ object VectorDedupBenchmark {
     val customUseNd4j = sys.env.get("BENCHMARK_USE_ND4J").map(_.toBoolean)
 
     // Create Spark session
+    // Note: spark.sql.shuffle.partitions and other configs should be set externally via spark-submit or SparkOperator
     val spark = SparkSession.builder()
       .appName("VectorDeduplicationBenchmark")
-      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-      .config("spark.kryoserializer.buffer.max", "512m")
-      .config("spark.sql.shuffle.partitions", "100")
-      .config("spark.driver.maxResultSize", "4g")
-      // Disable schema merging for Parquet to avoid SparkContext access during read
-      .config("spark.sql.parquet.mergeSchema", "false")
-      .config("spark.sql.files.ignoreCorruptFiles", "true")
       .getOrCreate()
 
     // Verify SparkContext is active before proceeding
